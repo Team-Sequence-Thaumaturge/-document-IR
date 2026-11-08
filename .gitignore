@@ -1,0 +1,18 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local regression outputs & private test documents (never commit user documents)
+regression_out/
+*.hwp
+*.hwpx
+*.docx
+*.pdf
+*.xlsx
+
+# Environment & local audit ledgers
+.env
+.venv/
+venv/
+.talos_uncertainty_brake_ledger.json
