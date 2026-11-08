@@ -30,6 +30,7 @@ from .ir_schema import (
     resolve_effective_document_spec,
     validate_text_immutability,
     extract_ir_non_ws_text,
+    compute_heading_slot_similarity,
     hu_to_pt,
 )
 from .elastic_solver import (
@@ -108,6 +109,18 @@ USER_SPEC_OVERRIDES_JSON_SCHEMA = {
             "type": "array",
             "items": {"type": "string"},
             "description": "Optional explicit caption strings for routed attachment images.",
+        },
+        "allow_font_size_elastic_scaling": {
+            "type": "boolean",
+            "description": "Allow Stage 6 micro-typography font scaling (-0.5pt) if Stage 5 still overflows.",
+        },
+        "clear_unmapped_slots": {
+            "type": "boolean",
+            "description": "Clear placeholder text in unmapped target section slots.",
+        },
+        "style_inheritance_mode": {
+            "type": "string",
+            "description": "Style resolution policy: TARGET_FIRST, SOURCE_FIRST, or HYBRID.",
         },
     },
 }
@@ -243,12 +256,14 @@ class TdirBetaMcpServer:
 
             sec_list_meta: List[dict] = []
             for s_uid, s_obj in secs.items():
-                all_sections[s_uid] = s_obj
+                eff_s_uid = s_uid if s_uid not in all_sections else f"{s_uid}_S{idx_s + 1}"
+                s_obj.section_uid = eff_s_uid
+                all_sections[eff_s_uid] = s_obj
                 n_tbls = sum(1 for b in s_obj.blocks if b["type"] == "tbl")
                 n_paras = sum(1 for b in s_obj.blocks if b["type"] == "p")
                 sec_list_meta.append(
                     {
-                        "section_uid": s_uid,
+                        "section_uid": eff_s_uid,
                         "heading_text": s_obj.heading_text,
                         "subtitle_text": s_obj.subtitle_text,
                         "non_ws_chars": s_obj.non_ws_char_count,
@@ -322,19 +337,39 @@ class TdirBetaMcpServer:
 
         slot_mapping: Dict[str, str] = {}
         solver_preview: Dict[str, dict] = {}
+        used_slot_uids = set()
 
         for s_uid, s_obj in job.sections.items():
             if include_set is not None and s_uid not in include_set:
                 continue
             if s_uid in exclude_set:
                 continue
+            base_s_uid = s_uid.split("_S")[0]
             matched_slot = next(
-                (sl for sl in eff_spec.section_slots if sl.slot_uid.startswith(s_uid)),
+                (sl for sl in eff_spec.section_slots if sl.slot_uid.startswith(base_s_uid)),
                 None,
             )
             if matched_slot is None and eff_spec.section_slots:
-                matched_slot = eff_spec.section_slots[0]
+                best_score = -1.0
+                best_slot = None
+                for sl in eff_spec.section_slots:
+                    sc = compute_heading_slot_similarity(
+                        s_obj.heading_text or s_uid,
+                        sl.discovered_title_text,
+                        sl.slot_uid,
+                    )
+                    if sc > best_score:
+                        best_score = sc
+                        best_slot = sl
+                if best_slot is not None and best_score >= 0.15:
+                    matched_slot = best_slot
+                else:
+                    matched_slot = next(
+                        (sl for sl in eff_spec.section_slots if sl.slot_uid not in used_slot_uids),
+                        eff_spec.section_slots[0],
+                    )
             if matched_slot is not None:
+                used_slot_uids.add(matched_slot.slot_uid)
                 slot_mapping[s_uid] = matched_slot.slot_uid
                 max_p = float(overrides_ir.section_page_budgets.get(s_uid, matched_slot.max_pages))
                 matched_slot.max_pages = max_p
@@ -553,11 +588,18 @@ class TdirBetaMcpServer:
 
             if export_pdf:
                 pdf_path = os.path.splitext(job.output_files["docx"])[0] + "_PDF.pdf"
+                esc_docx = os.path.abspath(job.output_files["docx"]).replace("'", "''")
+                esc_pdf = os.path.abspath(pdf_path).replace("'", "''")
                 ps_cmd = (
+                    f"$w = $null; $d = $null; "
+                    f"try {{ "
                     f"$w = New-Object -ComObject Word.Application; $w.Visible = $false; "
-                    f"$d = $w.Documents.Open('{job.output_files['docx']}'); "
-                    f"$d.ExportAsFixedFormat('{pdf_path}', 17); "
-                    f"$d.Close($false); $w.Quit()"
+                    f"$d = $w.Documents.Open('{esc_docx}'); "
+                    f"$d.ExportAsFixedFormat('{esc_pdf}', 17); "
+                    f"}} finally {{ "
+                    f"if ($d) {{ $d.Close($false) }}; "
+                    f"if ($w) {{ $w.Quit() }} "
+                    f"}}"
                 )
                 subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd], check=True)
                 job.output_files["pdf"] = pdf_path
@@ -592,12 +634,31 @@ class TdirBetaMcpServer:
                     c0 = cell["col"]
                     cs = cell["col_span"]
                     cell["width_hu"] = sum(blk["col_widths_hu"][c0 : c0 + cs])
+
+        eff_spec = job.target_spec or job.raw_target_spec
+        slot_uid = job.slot_mapping.get(section_uid)
+        sl_spec = (
+            next((sl for sl in eff_spec.section_slots if sl.slot_uid == slot_uid), None)
+            if (eff_spec and slot_uid)
+            else None
+        )
+        avail_w = sl_spec.available_width_hu if sl_spec else 46200
+        max_p = sl_spec.max_pages if sl_spec else 2.0
+        _, _, updated_tele = self.solver.solve_section_layout_budget(
+            sec.blocks,
+            target_pages=max_p,
+            outer_width_hu=avail_w,
+            target_spec=eff_spec,
+        )
+        job.solver_telemetry[section_uid] = updated_tele
+
         return {
             "job_id": job_id,
             "section_uid": section_uid,
             "block_index": block_index,
             "updated_block_type": blk["type"],
             "lock_unmerged": blk.get("lock_unmerged", False),
+            "updated_solver_preview": updated_tele,
         }
 
 
@@ -693,7 +754,7 @@ def handle_jsonrpc_request(server: TdirBetaMcpServer, req: dict) -> Optional[dic
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "tdir-document-beta", "version": "3.0.0-beta"},
+                "serverInfo": {"name": "tdir-document-beta", "version": "3.1.0-beta"},
             },
         }
     if method == "notifications/initialized":

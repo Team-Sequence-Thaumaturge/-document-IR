@@ -13,6 +13,8 @@ sys.stdout.reconfigure(encoding="utf-8")
 sys.path.insert(0, r"c:\Users\stella\Desktop\stella test")
 
 from tdir_mcp_beta.mcp_server import TdirBetaMcpServer, handle_jsonrpc_request
+from tdir_mcp_beta.ir_schema import detect_image_format, compute_heading_slot_similarity
+from tdir_mcp_beta.codec_hwp_v5 import extract_hwp_para_text
 
 TEMPLATE_HWP_PATH = r"C:\Users\stella\Downloads\모창 사업계획서 템플릿 test.hwp"
 SOURCE_DOCX_PATH = r"C:\Users\stella\Downloads\모창 2차 사업계획서 — 한컴독스_완벽호환본.docx"
@@ -164,6 +166,47 @@ def run_poc2_and_poc3_regression(srv: TdirBetaMcpServer) -> dict:
     poc1_res = run_poc1_markdown_and_standalone_regression(srv, job_id)
     print(f"[Step 8: PoC 1 Markdown Round-Trip Check] {poc1_res}")
 
+    # Step 9: v3.1.0-beta Bugfix & Edge-Case Verification Suite ([BUG-01..12], [EDGE-01..08], [GEN-01..05])
+    pay_emoji = "A🚀B\r".encode("utf-16le")
+    n_wchars_emoji = len(pay_emoji) // 2
+    assert n_wchars_emoji == 5, f"Expected 5 UTF-16LE WCHARs for 'A🚀B\\r', got {n_wchars_emoji}"
+    assert extract_hwp_para_text(pay_emoji).strip() == "A🚀B"
+
+    assert detect_image_format(b"\xff\xd8\xff\xe0\x00\x10JFIF") == ("jpg", "image/jpeg")
+    assert detect_image_format(b"\x89PNG\r\n\x1a\n\x00\x00") == ("png", "image/png")
+    assert "updated_solver_preview" in adj_res
+    assert compute_heading_slot_similarity("1. 문제 인식 (Problem)", "1. 문제 인식 (Problem)", "SLOT_1") > 0.5
+
+    edge_md_path = os.path.join(REGRESSION_OUT_DIR, "edge_case_codefence.md")
+    with open(edge_md_path, "w", encoding="utf-8") as f_md:
+        f_md.write(
+            "# Q1. 문제 인식\n\n"
+            "```python\n"
+            "x = a | b | c\n"
+            "```\n\n"
+            "| 구분 | 내용\\|설명 |\n"
+            "| --- | --- |\n"
+            "| 항목1 | 값A\\|값B |\n"
+        )
+    multi_probe = srv.tdir_probe_files([edge_md_path, edge_md_path], TEMPLATE_HWP_PATH)
+    assert len(multi_probe["sources"]) == 2
+    s1_uid = multi_probe["sources"][0]["sections_discovered"][0]["section_uid"]
+    s2_uid = multi_probe["sources"][1]["sections_discovered"][0]["section_uid"]
+    assert s1_uid == "Q1" and s2_uid == "Q1_S2", f"Expected Q1 and Q1_S2, got {s1_uid}, {s2_uid}"
+
+    md_standalone_exec = srv.tdir_execute_conversion(
+        job_id=multi_probe["job_id"],
+        output_prefix=os.path.join(REGRESSION_OUT_DIR, "standalone_from_md"),
+        output_formats=["docx"],
+        user_spec_overrides={"margins_mm": {"top": 15.0, "bottom": 15.0, "left": 20.0, "right": 20.0}},
+    )
+    assert os.path.isfile(md_standalone_exec["generated_files"]["docx"]["out_docx_path"])
+    print(
+        f"[Step 9: v3.1.0-beta Bugfix & Edge-Case Checks] "
+        f"emoji_wchars={n_wchars_emoji}, multi_source_uids=({s1_uid}, {s2_uid}), "
+        f"standalone_docx_bytes={md_standalone_exec['generated_files']['docx']['bytes']}"
+    )
+
     return {
         "init_ok": init_resp["result"]["serverInfo"]["name"] == "tdir-document-beta",
         "probe_res": probe_res,
@@ -178,7 +221,7 @@ def main() -> None:
     srv = TdirBetaMcpServer()
     summary = run_poc2_and_poc3_regression(srv)
     assert summary["pdf_pages"] == 8, f"Expected 8 pages in PDF, got {summary['pdf_pages']}"
-    print("\n=== ALL T-DIR v3.0 BETA MCP REGRESSION TESTS PASSED (100.00% FIDELITY, 8 PAGES) ===")
+    print("\n=== ALL T-DIR v3.1.0-BETA MCP REGRESSION TESTS PASSED (100.00% FIDELITY, 8 PAGES) ===")
 
 
 if __name__ == "__main__":

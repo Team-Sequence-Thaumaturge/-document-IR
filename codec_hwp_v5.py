@@ -1,8 +1,13 @@
 """
-HWP v5.0 Binary Record Parser, Dynamic Typography & Slot Scanner, Lifter, and Projector.
+HWP v5.0 Binary Record Parser, Dynamic Typography & Generalized Slot Scanner, Lifter, and Projector.
 Extracts all typography (FACE_NAME, CHAR_SHAPE, PARA_SHAPE), page geometry, preamble blocks,
 section slots, and attachment slots dynamically from the HWP binary streams without hardcoded
 font names, pixel/HWPUNIT constants, or domain strings.
+Includes:
+  - UTF-16LE surrogate-safe text decoding and 16-bit WCHAR length accounting ([BUG-03])
+  - Magic-byte dynamic image extension packing ([BUG-04])
+  - FileHeader compression flag inspection and multi-section (Section0..N) lifting ([EDGE-05], [EDGE-06])
+  - Generalized N x M form slot discovery and ordinal slot indexing ([GEN-01], [GEN-02])
 """
 
 import zlib
@@ -10,7 +15,13 @@ import struct
 from typing import List, Dict, Tuple, Optional
 
 from .cfb_ole2 import CFBArchive, write_cfb_file
-from .ir_schema import SlotSpecIR, SourceDocumentSpecIR, TargetDocumentSpecIR
+from .ir_schema import (
+    SlotSpecIR,
+    SourceDocumentSpecIR,
+    TargetDocumentSpecIR,
+    detect_image_format,
+    extract_ordinal_index,
+)
 from .elastic_solver import ElasticLayoutState
 
 
@@ -41,8 +52,38 @@ def parse_hwp_records(data: bytes) -> List[list]:
     return records
 
 
+def _is_hwp_compressed(cfb: CFBArchive) -> bool:
+    """
+    Inspects HWP FileHeader (offset 36) bit flags ([EDGE-06]):
+      - Bit 0 (0x1): deflate compressed streams
+      - Bit 1 (0x2): password encrypted
+    """
+    if any(e["name"] == "FileHeader" for e in cfb.entries):
+        fh = cfb.get_stream("FileHeader")
+        if len(fh) >= 40:
+            flags = struct.unpack_from("<I", fh, 36)[0]
+            if flags & 0x2:
+                raise ValueError("Encrypted HWP v5.0 files are not supported without decryption key.")
+            return bool(flags & 0x1)
+    return True
+
+
+def _read_hwp_stream(cfb: CFBArchive, stream_name: str) -> bytes:
+    raw = cfb.get_stream(stream_name)
+    if _is_hwp_compressed(cfb):
+        try:
+            return zlib.decompress(raw, -15)
+        except zlib.error:
+            return raw
+    return raw
+
+
 def extract_hwp_para_text(payload: bytes) -> str:
-    out: List[str] = []
+    """
+    Decodes HWP Tag 67 UTF-16LE paragraph text while properly skipping 16-byte extended
+    inline controls and preserving UTF-16LE surrogate pairs ([BUG-03]).
+    """
+    char_bytes = bytearray()
     i = 0
     while i + 1 < len(payload):
         ch = struct.unpack_from("<H", payload, i)[0]
@@ -53,9 +94,9 @@ def extract_hwp_para_text(payload: bytes) -> str:
         elif ch < 32:
             i += 2
         else:
-            out.append(chr(ch))
+            char_bytes.extend(payload[i : i + 2])
             i += 2
-    return "".join(out)
+    return bytes(char_bytes).decode("utf-16le", errors="replace")
 
 
 def parse_hex_rgb(hex_str: str) -> Tuple[int, int, int]:
@@ -79,8 +120,7 @@ def parse_face_name_record(payload: bytes) -> str:
 
 def make_face_name_payload(font_name: str) -> bytes:
     encoded = font_name.encode("utf-16le")
-    name_len = len(font_name)
-    # Property byte 0x21 (TTF + default type info), followed by name_len, UTF-16LE chars, and 10 zero bytes
+    name_len = len(encoded) // 2
     return struct.pack("<BH", 0x01, name_len) + encoded + (b"\x00" * 10)
 
 
@@ -122,6 +162,7 @@ def make_char_shape_payload(
     italic: bool,
     rgb: Tuple[int, int, int],
     face_ids_7: Tuple[int, int, int, int, int, int, int] = (0, 0, 0, 0, 0, 0, 0),
+    underline: bool = False,
 ) -> bytes:
     clamped_h = max(200, min(7200, height_hu))
     buf = bytearray(74)
@@ -129,7 +170,7 @@ def make_char_shape_payload(
     buf[14:21] = b"\x64" * 7
     buf[28:35] = b"\x64" * 7
     struct.pack_into("<i", buf, 42, clamped_h)
-    attr = (1 if italic else 0) | (2 if bold else 0)
+    attr = (1 if italic else 0) | (2 if bold else 0) | ((1 << 2) if underline else 0)
     struct.pack_into("<I", buf, 46, attr)
     buf[50] = 10
     buf[51] = 10
@@ -213,13 +254,13 @@ def scan_hwp_template_slots(template_path: str) -> TargetDocumentSpecIR:
       1. Typography (FACE_NAME, CHAR_SHAPE heights, PARA_SHAPE line spacing)
       2. Page setup (PAGE_DEF width, height, margins)
       3. Preamble/cover blocks preceding the first section slot table
-      4. 2x2 Section Outer Tables (Q1..Q4 titles, subtitles, column widths, body cell margins)
+      4. Section Outer Tables (both standard 2x2 tables and generalized N x M form tables `[GEN-01]`)
       5. Attachment header paragraphs and 6x2 Attachment Media Slots ('붙임')
     Zero hardcoded record indices, font names, or pixel/HWPUNIT constants.
     """
     cfb = CFBArchive(template_path)
-    docinfo_raw = zlib.decompress(cfb.get_stream("DocInfo"), -15)
-    sec0_raw = zlib.decompress(cfb.get_stream("Section0"), -15)
+    docinfo_raw = _read_hwp_stream(cfb, "DocInfo")
+    sec0_raw = _read_hwp_stream(cfb, "Section0")
     doc_recs = parse_hwp_records(docinfo_raw)
     sec_recs = parse_hwp_records(sec0_raw)
 
@@ -270,71 +311,14 @@ def scan_hwp_template_slots(template_path: str) -> TargetDocumentSpecIR:
                         w_cell, h_cell = struct.unpack_from("<2I", sec_recs[j][2], 16)
                         mar_4 = struct.unpack_from("<4H", sec_recs[j][2], 24)
                         cell_txt = ""
-                        if j + 2 < n_recs and sec_recs[j + 2][0] == 67:
+                        if j + 2 < n_recs and sec_recs[j][0] == 72 and sec_recs[j + 2][0] == 67:
                             cell_txt = extract_hwp_para_text(sec_recs[j + 2][2]).strip()
                         cs_id_cell = _extract_first_cs_id_after(sec_recs, j + 1)
                         cells_info.append((j, row_a, col_a, r_span, c_span, w_cell, h_cell, mar_4, cell_txt, cs_id_cell))
                     j += 1
 
-                # Case A: 2x2 Section Outer Table (Row 0 has title + subtitle, Row 1 has col_span=2 body cell)
-                if n_rows == 2 and n_cols == 2 and len(cells_info) >= 3:
-                    title_cell = next((c for c in cells_info if c[1] == 0 and c[2] == 0), None)
-                    sub_cell = next((c for c in cells_info if c[1] == 0 and c[2] == 1), None)
-                    body_cell = next((c for c in cells_info if c[1] == 1 and c[4] == 2), None)
-                    if title_cell and body_cell:
-                        t_str = title_cell[8]
-                        sub_str = sub_cell[8] if sub_cell else ""
-                        # Skip non-submission instruction boxes (e.g. '작성 요령' / '삭제 후 제출')
-                        if "작성 요령" in t_str or "삭제 후 제출" in sub_str:
-                            skipped_ranges.append((max(0, ctrl_idx - 3), j))
-                            i = j
-                            continue
-
-                        if first_sec_table_idx is None:
-                            first_sec_table_idx = ctrl_idx
-                            b_cs_id = body_cell[9] if body_cell[9] is not None else (sub_cell[9] if sub_cell else None)
-                            if b_cs_id is not None and 0 <= b_cs_id < len(char_shapes):
-                                f_id_b, h_hu_b, _, _ = char_shapes[b_cs_id]
-                                if 0 <= f_id_b < len(face_names) and face_names[f_id_b]:
-                                    spec.body_font_family = face_names[f_id_b]
-                                    spec.table_font_family = face_names[f_id_b]
-                                if h_hu_b > 0:
-                                    spec.body_font_size_hu = h_hu_b
-
-                        last_sec_table_end_idx = j
-                        slot_uid = f"SLOT_{len(spec.section_slots) + 1}"
-                        if "Q1" in t_str or "문제" in t_str:
-                            slot_uid = "Q1_BODY"
-                        elif "Q2" in t_str or "실현" in t_str:
-                            slot_uid = "Q2_BODY"
-                        elif "Q3" in t_str or "성장" in t_str:
-                            slot_uid = "Q3_BODY"
-                        elif "Q4" in t_str or "향후" in t_str:
-                            slot_uid = "Q4_BODY"
-
-                        col_w_list = [title_cell[5], sub_cell[5]] if sub_cell else [title_cell[5], body_cell[5] - title_cell[5]]
-                        b_mar = body_cell[7]
-                        pad_x = max(1400, (b_mar[0] + b_mar[1]) * 2)
-                        spec.section_slots.append(
-                            SlotSpecIR(
-                                slot_uid=slot_uid,
-                                slot_role="SECTION_BODY_SLOT",
-                                discovered_title_text=t_str,
-                                discovered_subtitle_text=sub_str,
-                                outer_tbl_record_idx=ctrl_idx,
-                                body_cell_record_idx=body_cell[0],
-                                outer_width_hu=w_outer if w_outer > 0 else sum(col_w_list),
-                                outer_height_hu=h_outer if h_outer > 0 else (title_cell[6] + body_cell[6]),
-                                col_widths_hu=col_w_list,
-                                header_height_hu=title_cell[6],
-                                cell_margins_hu=b_mar,
-                                available_width_hu=max(10000, body_cell[5] - pad_x),
-                                available_height_hu=body_cell[6],
-                                max_pages=2.0,
-                            )
-                        )
                 # Case B: 6x2 Photo Attachment Table ('붙임')
-                elif n_rows == 6 and n_cols == 2 and len(cells_info) >= 4:
+                if n_rows == 6 and n_cols == 2 and len(cells_info) >= 4:
                     attachment_table_idx = ctrl_idx
                     for pair_r in range(3):
                         for col_c in range(2):
@@ -364,6 +348,77 @@ def scan_hwp_template_slots(template_path: str) -> TargetDocumentSpecIR:
                                         max_pages=1.0,
                                     )
                                 )
+                    i = j
+                    continue
+
+                # Case A: Standard 2x2 Section Outer Table OR Generalized Form Container Table ([GEN-01])
+                title_cell = next((c for c in cells_info if c[1] == 0 and c[2] == 0), None)
+                sub_cell = next((c for c in cells_info if c[1] == 0 and c[2] >= 1), None)
+                body_cell = next(
+                    (
+                        c
+                        for c in cells_info
+                        if c[1] >= 1 and (c[4] == n_cols or c[5] >= 28000) and c[6] >= 3500
+                    ),
+                    None,
+                )
+                if (
+                    title_cell
+                    and body_cell
+                    and n_rows <= 4
+                    and bool(title_cell[8].strip())
+                    and title_cell[6] < body_cell[6]
+                ):
+                    t_str = title_cell[8]
+                    sub_str = sub_cell[8] if sub_cell else ""
+                    if "작성 요령" in t_str or "삭제 후 제출" in sub_str:
+                        skipped_ranges.append((max(0, ctrl_idx - 3), j))
+                        i = j
+                        continue
+
+                    if first_sec_table_idx is None:
+                        first_sec_table_idx = ctrl_idx
+                        b_cs_id = body_cell[9] if body_cell[9] is not None else (sub_cell[9] if sub_cell else None)
+                        if b_cs_id is not None and 0 <= b_cs_id < len(char_shapes):
+                            f_id_b, h_hu_b, _, _ = char_shapes[b_cs_id]
+                            if 0 <= f_id_b < len(face_names) and face_names[f_id_b]:
+                                spec.body_font_family = face_names[f_id_b]
+                                spec.table_font_family = face_names[f_id_b]
+                            if 800 <= h_hu_b <= 1500:
+                                spec.body_font_size_hu = h_hu_b
+
+                    last_sec_table_end_idx = j
+                    ord_idx = extract_ordinal_index(t_str)
+                    if ord_idx is not None:
+                        slot_uid = f"Q{ord_idx}_BODY"
+                    else:
+                        slot_uid = f"Q{len(spec.section_slots) + 1}_BODY"
+
+                    col_w_list = (
+                        [title_cell[5], sub_cell[5]]
+                        if sub_cell
+                        else [title_cell[5], max(1000, body_cell[5] - title_cell[5])]
+                    )
+                    b_mar = body_cell[7]
+                    pad_x = max(1400, (b_mar[0] + b_mar[1]) * 2)
+                    spec.section_slots.append(
+                        SlotSpecIR(
+                            slot_uid=slot_uid,
+                            slot_role="SECTION_BODY_SLOT",
+                            discovered_title_text=t_str,
+                            discovered_subtitle_text=sub_str,
+                            outer_tbl_record_idx=ctrl_idx,
+                            body_cell_record_idx=body_cell[0],
+                            outer_width_hu=w_outer if w_outer > 0 else sum(col_w_list),
+                            outer_height_hu=h_outer if h_outer > 0 else (title_cell[6] + body_cell[6]),
+                            col_widths_hu=col_w_list,
+                            header_height_hu=title_cell[6],
+                            cell_margins_hu=b_mar,
+                            available_width_hu=max(10000, body_cell[5] - pad_x),
+                            available_height_hu=body_cell[6],
+                            max_pages=2.0,
+                        )
+                    )
                 i = j
                 continue
         i += 1
@@ -436,29 +491,40 @@ def scan_hwp_source_spec(hwp_path: str) -> SourceDocumentSpecIR:
 
 
 def lift_hwp_to_ir(hwp_path: str) -> Tuple[str, List[dict]]:
+    """
+    Lifts all Section0..SectionN streams from an HWP v5.0 file ([EDGE-05], [EDGE-06]).
+    """
     cfb = CFBArchive(hwp_path)
-    sec0_raw = zlib.decompress(cfb.get_stream("Section0"), -15)
-    sec_recs = parse_hwp_records(sec0_raw)
+    sec_names = sorted(
+        (e["name"] for e in cfb.entries if e["type"] == 2 and e["name"].startswith("Section")),
+        key=lambda nm: int(nm[7:]) if nm[7:].isdigit() else 0,
+    )
+    if not sec_names:
+        sec_names = ["Section0"]
+
     all_texts: List[str] = []
     blocks: List[dict] = []
-    for tag_id, _, payload in sec_recs:
-        if tag_id == 67:
-            txt = extract_hwp_para_text(payload)
-            all_texts.append(txt)
-            if txt.strip():
-                blocks.append(
-                    {
-                        "type": "p",
-                        "jc": "both",
-                        "left_tw": 0,
-                        "right_tw": 0,
-                        "indent_tw": 0,
-                        "before_tw": 0,
-                        "after_tw": 10,
-                        "runs": [{"text": txt.strip(), "bold": False, "italic": False, "color": "000000"}],
-                        "r_embed": None,
-                    }
-                )
+    for s_name in sec_names:
+        sec_raw = _read_hwp_stream(cfb, s_name)
+        sec_recs = parse_hwp_records(sec_raw)
+        for tag_id, _, payload in sec_recs:
+            if tag_id == 67:
+                txt = extract_hwp_para_text(payload)
+                all_texts.append(txt)
+                if txt.strip():
+                    blocks.append(
+                        {
+                            "type": "p",
+                            "jc": "both",
+                            "left_tw": 0,
+                            "right_tw": 0,
+                            "indent_tw": 0,
+                            "before_tw": 0,
+                            "after_tw": 10,
+                            "runs": [{"text": txt.strip(), "bold": False, "italic": False, "color": "000000"}],
+                            "r_embed": None,
+                        }
+                    )
     return "".join(all_texts), blocks
 
 
@@ -474,7 +540,6 @@ def _resolve_or_register_hwp_font_ids(
     if len(face_rec_indices) != sum(lang_counts):
         return doc_recs, (0, 0, 0, 0, 0, 0, 0)
 
-    # Split Tag 19 records into the 7 language buckets
     buckets: List[List[list]] = []
     cursor = 0
     for cnt in lang_counts:
@@ -512,8 +577,8 @@ def project_ir_to_hwp(
     preserve_outer_tables: bool = True,
 ) -> dict:
     cfb = CFBArchive(template_path)
-    docinfo_raw = zlib.decompress(cfb.get_stream("DocInfo"), -15)
-    sec0_raw = zlib.decompress(cfb.get_stream("Section0"), -15)
+    docinfo_raw = _read_hwp_stream(cfb, "DocInfo")
+    sec0_raw = _read_hwp_stream(cfb, "Section0")
 
     doc_recs = parse_hwp_records(docinfo_raw)
     sec_recs = parse_hwp_records(sec0_raw)
@@ -521,7 +586,6 @@ def project_ir_to_hwp(
     id_map_idx = next(i for i, r in enumerate(doc_recs) if r[0] == 17)
     id_counts = list(struct.unpack("<18I", doc_recs[id_map_idx][2]))
 
-    # Resolve or dynamically register body and table font families in DocInfo Tag 19
     body_font_name = target_spec.body_font_family or "맑은 고딕"
     table_font_name = target_spec.table_font_family or body_font_name
     doc_recs, body_face_ids_7 = _resolve_or_register_hwp_font_ids(doc_recs, id_counts, body_font_name)
@@ -530,7 +594,6 @@ def project_ir_to_hwp(
     else:
         doc_recs, table_face_ids_7 = _resolve_or_register_hwp_font_ids(doc_recs, id_counts, table_font_name)
 
-    # Update PAGE_DEF (Tag 73) in Section0 if page dimensions/margins were overridden
     if target_spec.page_width_hu > 0 and target_spec.page_height_hu > 0:
         for idx_s, (tag_id, _, payload) in enumerate(sec_recs):
             if tag_id == 73 and len(payload) >= 24:
@@ -571,10 +634,11 @@ def project_ir_to_hwp(
     base_bin_id = id_counts[0] + 1
     for idx_a, (img_bytes, _) in enumerate(attachments):
         bin_id = base_bin_id + idx_a
+        ext_str, _ = detect_image_format(img_bytes)
         new_bin_records.append(
-            [18, 1, struct.pack("<HH", 1, bin_id) + struct.pack("<H", 3) + "png".encode("utf-16le")]
+            [18, 1, struct.pack("<HH", 1, bin_id) + struct.pack("<H", len(ext_str)) + ext_str.encode("utf-16le")]
         )
-        new_bindata_streams.append((f"BIN{bin_id:04X}.png", raw_deflate(img_bytes)))
+        new_bindata_streams.append((f"BIN{bin_id:04X}.{ext_str}", raw_deflate(img_bytes)))
         bf_img_payload = make_image_border_fill_payload(bin_id)
         bf_img_id = base_bf_count + len(new_bf_records) + 1
         new_bf_records.append([20, 1, bf_img_payload])
@@ -590,9 +654,10 @@ def project_ir_to_hwp(
         italic: bool,
         color_hex: str,
         face_ids_7: Tuple[int, int, int, int, int, int, int],
+        underline: bool = False,
     ) -> int:
         rgb = parse_hex_rgb(color_hex)
-        payload = make_char_shape_payload(height_hu, bold, italic, rgb, face_ids_7)
+        payload = make_char_shape_payload(height_hu, bold, italic, rgb, face_ids_7, underline=underline)
         if payload not in cs_cache:
             cs_id = base_cs_count + len(new_cs_records)
             cs_cache[payload] = cs_id
@@ -633,11 +698,11 @@ def project_ir_to_hwp(
     ) -> List[list]:
         ps_id = get_or_add_ps(
             p_block["jc"],
-            p_block["left_tw"],
-            p_block["right_tw"],
-            p_block["indent_tw"],
-            p_block["before_tw"],
-            p_block["after_tw"],
+            p_block.get("left_tw", 0),
+            p_block.get("right_tw", 0),
+            p_block.get("indent_tw", 0),
+            p_block.get("before_tw", 0),
+            p_block.get("after_tw", 0),
             line_spacing_pct,
         )
         runs = p_block["runs"]
@@ -659,12 +724,21 @@ def project_ir_to_hwp(
             txt = r["text"]
             if not txt:
                 continue
-            cs_id = get_or_add_cs(height_hu, r["bold"], r["italic"], r["color"], face_ids_7)
+            cs_id = get_or_add_cs(
+                height_hu,
+                bool(r.get("bold", False)),
+                bool(r.get("italic", False)),
+                str(r.get("color", "000000")),
+                face_ids_7,
+                underline=bool(r.get("underline", False)),
+            )
             if cs_id != last_cs_id:
                 cs_pairs.append((char_pos, cs_id))
                 last_cs_id = cs_id
-            text_buf.extend(txt.encode("utf-16le"))
-            char_pos += len(txt)
+            enc_u16 = txt.encode("utf-16le")
+            text_buf.extend(enc_u16)
+            # Count 16-bit WCHAR code units for surrogate pair safety ([BUG-03])
+            char_pos += len(enc_u16) // 2
         text_buf.extend(b"\r\x00")
         char_count = char_pos + 1
         if not cs_pairs:
@@ -745,7 +819,6 @@ def project_ir_to_hwp(
 
         return out_recs
 
-    # Agenda #1: Enforce treatAsChar=False and repeatHeader=False on discovered outer section tables
     if preserve_outer_tables:
         for s_slot in target_spec.section_slots:
             t_idx = s_slot.outer_tbl_record_idx
@@ -765,7 +838,6 @@ def project_ir_to_hwp(
                 p_l0[11] = 4
                 sec_recs[t_idx - 3][2] = bytes(p_l0)
 
-    # Agenda #2: Route attachments to discovered attachment slots
     for idx_a, (_, cap_str) in enumerate(attachments):
         if idx_a >= len(target_spec.attachment_slots):
             break
@@ -784,12 +856,13 @@ def project_ir_to_hwp(
             sec_recs[img_rec_idx + 1][2] = bytes(p_hdr)
 
         if cap_rec_idx >= 0 and cap_rec_idx + 2 < len(sec_recs) and sec_recs[cap_rec_idx + 2][0] == 67:
-            sec_recs[cap_rec_idx + 2][2] = cap_str.encode("utf-16le") + b"\r\x00"
+            cap_enc = cap_str.encode("utf-16le")
+            sec_recs[cap_rec_idx + 2][2] = cap_enc + b"\r\x00"
             p_chdr = bytearray(sec_recs[cap_rec_idx + 1][2])
-            struct.pack_into("<I", p_chdr, 0, 0x80000000 | (len(cap_str) + 1))
+            cap_wlen = (len(cap_enc) // 2) + 1
+            struct.pack_into("<I", p_chdr, 0, 0x80000000 | cap_wlen)
             sec_recs[cap_rec_idx + 1][2] = bytes(p_chdr)
 
-    # Build replacement map for body cell records (sorted in reverse index order)
     splices: List[Tuple[int, int, List[list]]] = []
     inst_seed = 0x50001000
     for s_slot in target_spec.section_slots:
@@ -813,7 +886,7 @@ def project_ir_to_hwp(
                     build_para_records(
                         blk,
                         2,
-                        target_spec.body_font_size_hu,
+                        el_state.body_font_size_hu or target_spec.body_font_size_hu,
                         el_state.body_line_spacing_pct,
                         is_last,
                         body_face_ids_7,

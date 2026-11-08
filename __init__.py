@@ -42,4 +42,4 @@ __all__ = [
     "MinimumInvasionElasticSolver",
     "TdirBetaMcpServer",
 ]
-__version__ = "3.0.0-beta"
+__version__ = "3.1.0-beta"

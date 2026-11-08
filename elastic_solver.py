@@ -1,9 +1,10 @@
 """
-T-DIR v3.0 2D Topological Grid Normalizer & 5-Stage Minimum-Invasion Elastic Layout Solver.
+T-DIR v3.1 2D Topological Grid Normalizer & 6-Stage Minimum-Invasion Elastic Layout Solver.
 Zero hardcoded font sizes, pixel/HWPUNIT constants, or document-specific strings:
-  - Table normalization relies purely on 2D grid sparsity and span topology.
-  - Line heights, character capacities, and page budgets scale proportionally with
-    the resolved TargetDocumentSpecIR / UserSpecOverrideIR typography and page geometry.
+  - Table normalization relies purely on 2D grid sparsity and span topology (with pre-spacer
+    and post-spacer stair-step detection `[BUG-01]`, `[BUG-02]` and non-zero `row_cols` invariant `[EDGE-02]`).
+  - Line heights, character capacities (with CJK/Latin East-Asian-Width weighting `[EDGE-04]`),
+    and page budgets scale proportionally with resolved typography and page geometry.
 """
 
 import math
@@ -11,7 +12,7 @@ import copy
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Set, Optional
 
-from .ir_schema import TargetDocumentSpecIR
+from .ir_schema import TargetDocumentSpecIR, compute_weighted_text_units
 
 
 @dataclass
@@ -184,6 +185,39 @@ def detect_and_remove_spacer_rows_cols(
     n_rows_new = len(active_rows)
     n_cols_new = len(active_cols)
 
+    # Check post-spacer compact subgrid for stair-step topology ([BUG-02])
+    compact_grid: List[List[Optional[dict]]] = [[None for _ in range(n_cols_new)] for _ in range(n_rows_new)]
+    seen_compact: Set[int] = set()
+    for old_r in active_rows:
+        for old_c in range(n_cols_raw):
+            cobj = grid_cells[old_r][old_c]
+            if cobj is None or id(cobj) in seen_compact:
+                continue
+            seen_compact.add(id(cobj))
+            sp_cols = [c for c in range(cobj["col"], cobj["col"] + cobj["col_span"]) if c in col_map]
+            sp_rows = [r for r in range(cobj["row"], cobj["row"] + cobj["row_span"]) if r in row_map]
+            if not sp_cols or not sp_rows:
+                continue
+            nr = row_map[sp_rows[0]]
+            nc = col_map[sp_cols[0]]
+            nrs = len(sp_rows)
+            ncs = len(sp_cols)
+            ccopy = copy.deepcopy(cobj)
+            ccopy["row"], ccopy["col"], ccopy["row_span"], ccopy["col_span"] = nr, nc, nrs, ncs
+            for dr in range(nrs):
+                for dc in range(ncs):
+                    if nr + dr < n_rows_new and nc + dc < n_cols_new:
+                        compact_grid[nr + dr][nc + dc] = ccopy
+
+    if is_stair_step_sparse_grid(compact_grid, n_rows_new, n_cols_new):
+        return collapse_stair_step_chart_table(
+            compact_grid,
+            target_width_hu,
+            n_cols_raw=n_cols_new,
+            table_font_size_hu=table_font_size_hu,
+            n_rows_raw=n_rows_new,
+        )
+
     col_widths_hu = normalize_column_ratios_with_arrow_clamp(
         grid_cells, active_rows, active_cols, col_twips, target_width_hu, table_font_size_hu
     )
@@ -241,6 +275,22 @@ def detect_and_remove_spacer_rows_cols(
     for c in new_cells:
         row_cols[c["row"]] += 1
 
+    # Enforce HWP Tag 77 invariant: every row must have row_cols[r] >= 1 ([EDGE-02])
+    if any(rc == 0 for rc in row_cols):
+        valid_new_rows = [r_idx for r_idx, rc in enumerate(row_cols) if rc > 0]
+        if valid_new_rows:
+            remap_r = {old_nr: idx_nr for idx_nr, old_nr in enumerate(valid_new_rows)}
+            for c in new_cells:
+                r0 = c["row"]
+                r1 = r0 + c["row_span"]
+                kept_span = [rr for rr in range(r0, r1) if rr in remap_r]
+                c["row"] = remap_r[kept_span[0]] if kept_span else 0
+                c["row_span"] = max(1, len(kept_span))
+            n_rows_new = len(valid_new_rows)
+            row_cols = [0] * n_rows_new
+            for c in new_cells:
+                row_cols[c["row"]] += 1
+
     return {
         "type": "tbl",
         "n_rows": n_rows_new,
@@ -261,7 +311,6 @@ def normalize_column_ratios_with_arrow_clamp(
     target_width_hu: int,
     table_font_size_hu: int = 1000,
 ) -> List[int]:
-    n_cols_new = len(active_cols)
     active_twips = [col_twips[c] if c < len(col_twips) else 1000 for c in active_cols]
     arrow_width_hu = max(1200, int(round(table_font_size_hu * 1.6)))
 
@@ -288,20 +337,23 @@ def collapse_stair_step_chart_table(
     target_width_hu: int,
     n_cols_raw: int = 4,
     table_font_size_hu: int = 1000,
+    n_rows_raw: Optional[int] = None,
 ) -> dict:
     """
-    Collapses a stair-step sparse bar chart table into a compact 4-row grid:
+    Collapses a stair-step sparse bar chart table into a compact 3-row or 4-row grid ([BUG-01]):
       Row 0: Header banner (col_span=n_cols_raw)
       Row 1: Chronological data cells (C0 .. C_{n-1}) extracted from the sparse stair-step rows
       Row 2: Axis label cells (C0 .. C_{n-1})
-      Row 3: Footer summary banner (col_span=n_cols_raw)
+      Row 3: Optional footer summary banner (col_span=n_cols_raw) if present
     """
+    total_rows_in = n_rows_raw if n_rows_raw is not None else len(grid_cells)
     w_col = target_width_hu // max(1, n_cols_raw)
     col_w = [w_col] * n_cols_raw
     col_w[-1] += target_width_hu - sum(col_w)
     line_h_est = int(round(table_font_size_hu * 1.1))
 
-    hdr_cell = copy.deepcopy(grid_cells[0][0])
+    hdr_src = grid_cells[0][0] if (grid_cells and grid_cells[0] and grid_cells[0][0]) else {"fill_hex": "1E293B", "paras": []}
+    hdr_cell = copy.deepcopy(hdr_src)
     hdr_cell["row"], hdr_cell["col"], hdr_cell["row_span"], hdr_cell["col_span"] = 0, 0, 1, n_cols_raw
     hdr_cell["width_hu"], hdr_cell["height_hu"] = target_width_hu, max(850, line_h_est)
     hdr_cell["mar"] = (140, 140, 35, 35)
@@ -310,7 +362,7 @@ def collapse_stair_step_chart_table(
     bar_cells: List[dict] = []
     for c_idx in range(n_cols_raw):
         found = None
-        for r_idx in range(1, 1 + n_cols_raw):
+        for r_idx in range(1, min(total_rows_in, 1 + n_cols_raw)):
             cand = grid_cells[r_idx][c_idx]
             if cand is not None and len(cand["paras"]) > 0:
                 found = copy.deepcopy(cand)
@@ -323,34 +375,40 @@ def collapse_stair_step_chart_table(
         found["borders"] = {s: (1, 1, (0x94, 0xA3, 0xB8)) for s in ("left", "right", "top", "bottom")}
         bar_cells.append(found)
 
-    axis_row_idx = 1 + n_cols_raw
+    axis_row_idx = min(total_rows_in - 1, 1 + n_cols_raw)
     year_cells: List[dict] = []
     for c_idx in range(n_cols_raw):
-        yc = copy.deepcopy(grid_cells[axis_row_idx][c_idx])
+        yc_src = grid_cells[axis_row_idx][c_idx] if grid_cells[axis_row_idx][c_idx] is not None else {"fill_hex": None, "paras": []}
+        yc = copy.deepcopy(yc_src)
         yc["row"], yc["col"], yc["row_span"], yc["col_span"] = 2, c_idx, 1, 1
         yc["width_hu"], yc["height_hu"] = col_w[c_idx], max(750, line_h_est)
         yc["mar"] = (120, 120, 25, 25)
         yc["borders"] = {s: (1, 1, (0x94, 0xA3, 0xB8)) for s in ("left", "right", "top", "bottom")}
         year_cells.append(yc)
 
-    ftr_cell = copy.deepcopy(grid_cells[axis_row_idx + 1][0])
-    ftr_cell["row"], ftr_cell["col"], ftr_cell["row_span"], ftr_cell["col_span"] = 3, 0, 1, n_cols_raw
-    ftr_cell["width_hu"], ftr_cell["height_hu"] = target_width_hu, max(850, line_h_est)
-    ftr_cell["mar"] = (140, 140, 35, 35)
-    ftr_cell["borders"] = {s: (1, 1, (0x94, 0xA3, 0xB8)) for s in ("left", "right", "top", "bottom")}
+    all_cells = [hdr_cell] + bar_cells + year_cells
+    row_cols_out = [1, n_cols_raw, n_cols_raw]
+    total_h_hu = hdr_cell["height_hu"] + bar_cells[0]["height_hu"] + year_cells[0]["height_hu"]
 
-    all_cells = [hdr_cell] + bar_cells + year_cells + [ftr_cell]
+    if axis_row_idx + 1 < total_rows_in and grid_cells[axis_row_idx + 1][0] is not None:
+        ftr_cell = copy.deepcopy(grid_cells[axis_row_idx + 1][0])
+        ftr_cell["row"], ftr_cell["col"], ftr_cell["row_span"], ftr_cell["col_span"] = 3, 0, 1, n_cols_raw
+        ftr_cell["width_hu"], ftr_cell["height_hu"] = target_width_hu, max(850, line_h_est)
+        ftr_cell["mar"] = (140, 140, 35, 35)
+        ftr_cell["borders"] = {s: (1, 1, (0x94, 0xA3, 0xB8)) for s in ("left", "right", "top", "bottom")}
+        all_cells.append(ftr_cell)
+        row_cols_out.append(1)
+        total_h_hu += ftr_cell["height_hu"]
+
     return {
         "type": "tbl",
-        "n_rows": 4,
+        "n_rows": len(row_cols_out),
         "n_cols": n_cols_raw,
         "col_widths_hu": col_w,
-        "row_cols": [1, n_cols_raw, n_cols_raw, 1],
+        "row_cols": row_cols_out,
         "cells": all_cells,
         "width_hu": target_width_hu,
-        "height_hu": sum(
-            (hdr_cell["height_hu"], bar_cells[0]["height_hu"], year_cells[0]["height_hu"], ftr_cell["height_hu"])
-        ),
+        "height_hu": total_h_hu,
     }
 
 
@@ -399,9 +457,10 @@ def estimate_block_height_hu(blk: dict, state: ElasticLayoutState, outer_width_h
         txt = "".join(r["text"] for r in blk["runs"])
         if not txt.strip():
             return 0
+        eff_units = 0.70 * len(txt) + 0.30 * compute_weighted_text_units(txt)
         char_w_hu = max(340.0, b_font_hu * 0.85)
         chars_per_line = max(10.0, (outer_width_hu - 700) / char_w_hu)
-        n_lines = max(1, math.ceil(len(txt) / chars_per_line))
+        n_lines = max(1, math.ceil(eff_units / chars_per_line))
         line_h_hu = int(round(b_font_hu * (state.body_line_spacing_pct / 100.0)))
         return n_lines * line_h_hu + state.para_after_tw * 5 + 20
 
@@ -419,8 +478,9 @@ def estimate_block_height_hu(blk: dict, state: ElasticLayoutState, outer_width_h
                 chars_per_line = max(4.0, eff_w / char_w_tbl_hu)
                 cell_lines = 0
                 for p in cell["paras"]:
-                    p_len = sum(len(r["text"]) for r in p["runs"])
-                    cell_lines += max(1, math.ceil(p_len / chars_per_line))
+                    p_txt = "".join(r["text"] for r in p["runs"])
+                    p_units = 0.70 * len(p_txt) + 0.30 * compute_weighted_text_units(p_txt)
+                    cell_lines += max(1, math.ceil(p_units / chars_per_line))
                 line_h_hu = int(round(t_font_hu * (state.table_line_spacing_pct / 100.0)))
                 cell_h = cell_lines * line_h_hu + 2 * state.cell_pad_v_hu + len(cell["paras"]) * 20
                 max_row_h = max(max_row_h, cell_h)
@@ -435,7 +495,7 @@ def estimate_section_height_hu(blocks: List[dict], state: ElasticLayoutState, ou
 
 class MinimumInvasionElasticSolver:
     """
-    5-Stage Progressive Elastic Solver with Early-Stop:
+    6-Stage Progressive Elastic Solver with Early-Stop:
     Dynamically scales line height and character capacity from TargetDocumentSpecIR
     and preserves maximum original paragraph & table cell line breaks.
     """
@@ -449,6 +509,8 @@ class MinimumInvasionElasticSolver:
         target_pages: float = 2.0,
         outer_width_hu: int = 46200,
         target_spec: Optional[TargetDocumentSpecIR] = None,
+        allow_font_size_elastic_scaling: bool = False,
+        preserve_inline_media: bool = False,
     ) -> Tuple[List[dict], ElasticLayoutState, dict]:
         eff_page_h = compute_effective_page_body_height_hu(target_spec, self.page_body_height_hu)
         budget_hu = int(round(target_pages * eff_page_h))
@@ -481,7 +543,7 @@ class MinimumInvasionElasticSolver:
 
         blocks: List[dict] = []
         for b in raw_blocks:
-            if b["type"] == "p" and b.get("r_embed") and not b["runs"]:
+            if not preserve_inline_media and b["type"] == "p" and b.get("r_embed") and not b["runs"]:
                 continue
             blocks.append(copy.deepcopy(b))
 
@@ -606,7 +668,26 @@ class MinimumInvasionElasticSolver:
             del blocks[best_b_idx + 1]
             state.merged_body_pairs_count += 1
 
-        state.stopped_stage = "STAGE_5_MINIMAL_BODY_CONTINUATION_EARLY_STOP"
+        if estimate_section_height_hu(blocks, state, outer_width_hu) <= budget_hu or not allow_font_size_elastic_scaling:
+            state.stopped_stage = "STAGE_5_MINIMAL_BODY_CONTINUATION_EARLY_STOP"
+            return self._finalize_result(
+                blocks, state, budget_hu, outer_width_hu, initial_height_hu, initial_para_count, initial_cell_para_count
+            )
+
+        # Stage 6 ([EDGE-03]): Optional micro-typography font scaling (-0.5pt steps, max -1.0pt)
+        for delta_hu in (50, 100):
+            state.body_font_size_hu = max(800, b_font_hu - delta_hu)
+            state.table_font_size_hu = max(750, t_font_hu - delta_hu)
+            state.body_line_tw = compute_proportional_line_tw(
+                state.body_font_size_hu, state.body_line_spacing_pct, is_table=False
+            )
+            state.table_line_tw = compute_proportional_line_tw(
+                state.table_font_size_hu, state.table_line_spacing_pct, is_table=True
+            )
+            if estimate_section_height_hu(blocks, state, outer_width_hu) <= budget_hu:
+                break
+
+        state.stopped_stage = "STAGE_6_FONT_SCALE_EARLY_STOP"
         return self._finalize_result(
             blocks, state, budget_hu, outer_width_hu, initial_height_hu, initial_para_count, initial_cell_para_count
         )

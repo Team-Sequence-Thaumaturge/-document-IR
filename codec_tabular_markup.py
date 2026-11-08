@@ -4,11 +4,12 @@ Enables N-to-M conversion across Markdown, HTML, CSV/TSV, XLSX, and HWP/HWPX/DOC
 """
 
 import os
+import re
 import csv
 from html.parser import HTMLParser
 from typing import List, Dict
 
-from .ir_schema import SectionIR, extract_ir_non_ws_text
+from .ir_schema import SectionIR, extract_ir_non_ws_text, extract_ordinal_index
 
 
 def lift_markdown_to_ir(md_path: str, target_width_hu: int = 46200) -> Dict[str, SectionIR]:
@@ -89,10 +90,32 @@ def lift_markdown_to_ir(md_path: str, target_width_hu: int = 46200) -> Dict[str,
         )
         cur_blocks = []
 
+    in_code_block = False
     for line in lines:
         stripped = line.strip()
-        if stripped.startswith("|") and stripped.endswith("|"):
-            cells_raw = [c.strip() for c in stripped.strip("|").split("|")]
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            flush_table()
+            in_code_block = not in_code_block
+            continue
+        if in_code_block:
+            if line:
+                cur_blocks.append(
+                    {
+                        "type": "p",
+                        "jc": "left",
+                        "left_tw": 0,
+                        "right_tw": 0,
+                        "indent_tw": 0,
+                        "before_tw": 0,
+                        "after_tw": 4,
+                        "runs": [{"text": line, "bold": False, "italic": False, "color": "000000"}],
+                        "r_embed": None,
+                    }
+                )
+            continue
+        if stripped.startswith("|") and stripped.endswith("|") and len(stripped) >= 2:
+            raw_inner = stripped[1:-1]
+            cells_raw = [c.replace(r"\|", "|").strip() for c in re.split(r"(?<!\\)\|", raw_inner)]
             if all(set(c) <= {"-", ":", " "} for c in cells_raw):
                 continue
             table_buffer.append(cells_raw)
@@ -103,7 +126,11 @@ def lift_markdown_to_ir(md_path: str, target_width_hu: int = 46200) -> Dict[str,
         if stripped.startswith("# "):
             flush_sec()
             cur_heading = stripped[2:].strip()
-            cur_sec_id = f"SEC_{len(sections) + 1}"
+            ord_idx = extract_ordinal_index(cur_heading)
+            if cur_heading.startswith(("Q", "q")) and ord_idx is not None:
+                cur_sec_id = f"Q{ord_idx}"
+            else:
+                cur_sec_id = f"SEC_{len(sections) + 1}"
             continue
         is_bold_heading = stripped.startswith("##")
         clean_txt = stripped.lstrip("#").strip() if is_bold_heading else stripped

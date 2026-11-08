@@ -24,6 +24,8 @@ from .ir_schema import (
     hu_to_twips,
     twips_to_hu,
     hu_to_emu,
+    detect_image_format,
+    extract_ordinal_index,
 )
 from .elastic_solver import (
     ElasticLayoutState,
@@ -142,11 +144,21 @@ def scan_docx_style_and_page_spec(docx_path: str) -> SourceDocumentSpecIR:
 def extract_docx_p_data(p_el: ET.Element, is_in_table: bool) -> dict:
     pPr = p_el.find(w_tag("pPr"))
     jc = "both"
+    left_tw = 0
+    right_tw = 0
+    indent_tw = 0
     before_tw, after_tw = (0, 0) if is_in_table else (0, 8)
     if pPr is not None:
         jc_el = pPr.find(w_tag("jc"))
         if jc_el is not None:
             jc = jc_el.get(w_tag("val"), "both")
+        ind_el = pPr.find(w_tag("ind"))
+        if ind_el is not None:
+            left_tw = int(ind_el.get(w_tag("left"), "0") or 0)
+            right_tw = int(ind_el.get(w_tag("right"), "0") or 0)
+            first_l = int(ind_el.get(w_tag("firstLine"), "0") or 0)
+            hanging = int(ind_el.get(w_tag("hanging"), "0") or 0)
+            indent_tw = -hanging if hanging > 0 else first_l
 
     blip = p_el.find(f".//{{{A_NS}}}blip")
     r_embed = blip.get(f"{{{R_NS}}}embed") if blip is not None else None
@@ -163,6 +175,7 @@ def extract_docx_p_data(p_el: ET.Element, is_in_table: bool) -> dict:
         rPr = r_el.find(w_tag("rPr"))
         bold = False
         italic = False
+        underline = False
         color_hex = "000000"
         if rPr is not None:
             b_el = rPr.find(w_tag("b"))
@@ -171,6 +184,9 @@ def extract_docx_p_data(p_el: ET.Element, is_in_table: bool) -> dict:
             i_el = rPr.find(w_tag("i"))
             if i_el is not None and i_el.get(w_tag("val"), "true") not in ("0", "false"):
                 italic = True
+            u_el = rPr.find(w_tag("u"))
+            if u_el is not None and u_el.get(w_tag("val"), "single") not in ("0", "false", "none"):
+                underline = True
             c_el = rPr.find(w_tag("color"))
             if c_el is not None:
                 c_val = c_el.get(w_tag("val"), "000000")
@@ -181,6 +197,7 @@ def extract_docx_p_data(p_el: ET.Element, is_in_table: bool) -> dict:
                 "text": txt,
                 "bold": bold,
                 "italic": italic,
+                "underline": underline,
                 "color": color_hex,
             }
         )
@@ -188,9 +205,9 @@ def extract_docx_p_data(p_el: ET.Element, is_in_table: bool) -> dict:
     return {
         "type": "p",
         "jc": jc,
-        "left_tw": 0,
-        "right_tw": 0,
-        "indent_tw": 0,
+        "left_tw": left_tw,
+        "right_tw": right_tw,
+        "indent_tw": indent_tw,
         "before_tw": before_tw,
         "after_tw": after_tw,
         "runs": runs,
@@ -245,7 +262,7 @@ def extract_docx_tbl_normalized(
                 master = grid_cells[r_idx - 1][c_cursor]
                 if master is not None and master["col"] == c_cursor and master["row"] + master["row_span"] == r_idx:
                     master["row_span"] += 1
-                    for p_el in tc.findall(w_tag("p")):
+                    for p_el in tc.findall(f".//{w_tag('p')}"):
                         pdata = extract_docx_p_data(p_el, is_in_table=True)
                         if pdata["runs"]:
                             master["paras"].append(pdata)
@@ -255,7 +272,7 @@ def extract_docx_tbl_normalized(
                     continue
 
             paras: List[dict] = []
-            for p_el in tc.findall(w_tag("p")):
+            for p_el in tc.findall(f".//{w_tag('p')}"):
                 pdata = extract_docx_p_data(p_el, is_in_table=True)
                 if pdata["runs"]:
                     paras.append(pdata)
@@ -310,7 +327,16 @@ def lift_docx_to_ir(
 
         doc_root = ET.fromstring(zf.read("word/document.xml"))
         body = doc_root.find(w_tag("body"))
-        children = list(body) if body is not None else []
+        raw_children = list(body) if body is not None else []
+        # Unwrap <w:sdt><w:sdtContent> containers recursively ([EDGE-07])
+        children: List[ET.Element] = []
+        for rc_el in raw_children:
+            if rc_el.tag.split("}")[-1] == "sdt":
+                sdt_c = rc_el.find(w_tag("sdtContent"))
+                if sdt_c is not None:
+                    children.extend(list(sdt_c))
+            else:
+                children.append(rc_el)
 
         cur_sec_id = "PREAMBLE"
         cur_heading = "Document Preamble"
@@ -355,6 +381,8 @@ def lift_docx_to_ir(
                     new_sec_key = "Q4"
                 elif ptxt == "출처" or ptxt.startswith("[출처]"):
                     new_sec_key = "REFERENCES"
+                elif ptxt.startswith(("Q", "q")) and extract_ordinal_index(ptxt) is not None:
+                    new_sec_key = f"Q{extract_ordinal_index(ptxt)}"
 
                 if new_sec_key is not None:
                     flush_section()
@@ -368,6 +396,7 @@ def lift_docx_to_ir(
                             or "사업화 계획" in nxt_txt
                             or "문제 인식" in nxt_txt
                             or "해결 방안" in nxt_txt
+                            or nxt_txt.startswith("※")
                         ):
                             cur_subtitle = nxt_txt
                             i += 2
@@ -380,7 +409,7 @@ def lift_docx_to_ir(
                     zip_media_path = rel_target if rel_target.startswith("word/") else f"word/{rel_target}"
                     if zip_media_path in zf.namelist():
                         raw_img = zf.read(zip_media_path)
-                        # Check for an adjacent or inline caption hint
+                        _, det_mime = detect_image_format(raw_img)
                         cap_hint = ptxt
                         if not cap_hint and cur_blocks and cur_blocks[-1]["type"] == "p":
                             prev_txt = "".join(r["text"] for r in cur_blocks[-1]["runs"]).strip()
@@ -393,7 +422,7 @@ def lift_docx_to_ir(
                                 media_uid=f"{cur_sec_id}_IMG_{len(cur_media) + 1}",
                                 rel_id=pdata["r_embed"],
                                 filename=os.path.basename(zip_media_path),
-                                mime_type="image/png",
+                                mime_type=det_mime,
                                 raw_bytes=raw_img,
                                 caption_hint=cap_hint,
                             )
@@ -427,16 +456,54 @@ def project_ir_to_docx(
     body_sz_hp = hu_to_half_pt(target_spec.body_font_size_hu if target_spec.body_font_size_hu > 0 else 1200)
     table_sz_hp = hu_to_half_pt(target_spec.table_font_size_hu if target_spec.table_font_size_hu > 0 else 1000)
 
-    with zipfile.ZipFile(source_docx_path, "r") as src_zip:
-        doc_xml = src_zip.read("word/document.xml")
+    has_valid_src_docx = False
+    if source_docx_path and os.path.isfile(source_docx_path) and zipfile.is_zipfile(source_docx_path):
+        with zipfile.ZipFile(source_docx_path, "r") as z_chk:
+            if "word/document.xml" in z_chk.namelist():
+                has_valid_src_docx = True
+
+    if has_valid_src_docx:
+        with zipfile.ZipFile(source_docx_path, "r") as src_zip:
+            doc_xml = src_zip.read("word/document.xml")
+    else:
+        doc_xml = (
+            b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            b'<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+            b'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" '
+            b'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" '
+            b'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+            b'xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">'
+            b'<w:body><w:sectPr><w:pgSz w:w="11906" w:h="16838"/>'
+            b'<w:pgMar w:top="560" w:right="950" w:bottom="560" w:left="950" w:header="360" w:footer="360" w:gutter="0"/>'
+            b'</w:sectPr></w:body></w:document>'
+        )
+
+    if True:
         root = ET.fromstring(doc_xml)
         for k in list(root.attrib.keys()):
             if k.endswith("Ignorable"):
                 del root.attrib[k]
         body = root.find(w_tag("body"))
         assert body is not None
-        sectPr = copy.deepcopy(body.find(w_tag("sectPr")))
-        assert sectPr is not None
+        sectPr_orig = body.find(w_tag("sectPr"))
+        if sectPr_orig is not None:
+            sectPr = copy.deepcopy(sectPr_orig)
+        else:
+            sectPr = ET.Element(w_tag("sectPr"))
+            ET.SubElement(sectPr, w_tag("pgSz"), {w_tag("w"): "11906", w_tag("h"): "16838"})
+            ET.SubElement(
+                sectPr,
+                w_tag("pgMar"),
+                {
+                    w_tag("top"): "560",
+                    w_tag("right"): "950",
+                    w_tag("bottom"): "560",
+                    w_tag("left"): "950",
+                    w_tag("header"): "360",
+                    w_tag("footer"): "360",
+                    w_tag("gutter"): "0",
+                },
+            )
 
         pgSz = sectPr.find(w_tag("pgSz"))
         if pgSz is not None and target_spec.page_width_hu > 0 and target_spec.page_height_hu > 0:
@@ -445,10 +512,16 @@ def project_ir_to_docx(
 
         pgMar = sectPr.find(w_tag("pgMar"))
         if pgMar is not None:
-            top_tw = min(560, hu_to_twips(target_spec.margin_top_hu)) if target_spec.margin_top_hu > 0 else 560
-            bot_tw = min(560, hu_to_twips(target_spec.margin_bottom_hu)) if target_spec.margin_bottom_hu > 0 else 560
-            left_tw = min(950, hu_to_twips(target_spec.margin_left_hu)) if target_spec.margin_left_hu > 0 else 950
-            right_tw = min(950, hu_to_twips(target_spec.margin_right_hu)) if target_spec.margin_right_hu > 0 else 950
+            if target_spec.margins_explicitly_overridden:
+                top_tw = hu_to_twips(target_spec.margin_top_hu) if target_spec.margin_top_hu > 0 else 560
+                bot_tw = hu_to_twips(target_spec.margin_bottom_hu) if target_spec.margin_bottom_hu > 0 else 560
+                left_tw = hu_to_twips(target_spec.margin_left_hu) if target_spec.margin_left_hu > 0 else 950
+                right_tw = hu_to_twips(target_spec.margin_right_hu) if target_spec.margin_right_hu > 0 else 950
+            else:
+                top_tw = min(560, hu_to_twips(target_spec.margin_top_hu)) if target_spec.margin_top_hu > 0 else 560
+                bot_tw = min(560, hu_to_twips(target_spec.margin_bottom_hu)) if target_spec.margin_bottom_hu > 0 else 560
+                left_tw = min(950, hu_to_twips(target_spec.margin_left_hu)) if target_spec.margin_left_hu > 0 else 950
+                right_tw = min(950, hu_to_twips(target_spec.margin_right_hu)) if target_spec.margin_right_hu > 0 else 950
             pgMar.set(w_tag("top"), str(top_tw))
             pgMar.set(w_tag("bottom"), str(bot_tw))
             pgMar.set(w_tag("left"), str(left_tw))
@@ -508,6 +581,8 @@ def project_ir_to_docx(
                     ET.SubElement(rPr, w_tag("b"))
                 if r_info.get("italic"):
                     ET.SubElement(rPr, w_tag("i"))
+                if r_info.get("underline"):
+                    ET.SubElement(rPr, w_tag("u"), {w_tag("val"): "single"})
                 ET.SubElement(rPr, w_tag("color"), {w_tag("val"): r_info.get("color", "000000")})
                 ET.SubElement(rPr, w_tag("sz"), {w_tag("val"): str(sz_half_pt)})
                 ET.SubElement(rPr, w_tag("szCs"), {w_tag("val"): str(sz_half_pt)})
@@ -953,12 +1028,40 @@ def project_ir_to_docx(
 
         os.makedirs(os.path.dirname(os.path.abspath(out_docx_path)), exist_ok=True)
         new_doc_xml = ET.tostring(root, encoding="utf-8", xml_declaration=True)
-        with zipfile.ZipFile(out_docx_path, "w", zipfile.ZIP_DEFLATED) as zout:
-            for item in src_zip.infolist():
-                if item.filename == "word/document.xml":
-                    zout.writestr(item, new_doc_xml)
-                else:
-                    zout.writestr(item, src_zip.read(item.filename))
+        if has_valid_src_docx:
+            with zipfile.ZipFile(source_docx_path, "r") as src_zip, zipfile.ZipFile(
+                out_docx_path, "w", zipfile.ZIP_DEFLATED
+            ) as zout:
+                for item in src_zip.infolist():
+                    if item.filename == "word/document.xml":
+                        zout.writestr(item, new_doc_xml)
+                    else:
+                        zout.writestr(item, src_zip.read(item.filename))
+        else:
+            content_types_xml = (
+                b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                b'<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                b'<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+                b'<Default Extension="xml" ContentType="application/xml"/>'
+                b'<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+                b'</Types>'
+            )
+            root_rels_xml = (
+                b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                b'<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>'
+                b'</Relationships>'
+            )
+            doc_rels_xml = (
+                b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                b'</Relationships>'
+            )
+            with zipfile.ZipFile(out_docx_path, "w", zipfile.ZIP_DEFLATED) as zout:
+                zout.writestr("[Content_Types].xml", content_types_xml)
+                zout.writestr("_rels/.rels", root_rels_xml)
+                zout.writestr("word/_rels/document.xml.rels", doc_rels_xml)
+                zout.writestr("word/document.xml", new_doc_xml)
 
     return {
         "out_docx_path": out_docx_path,
@@ -988,19 +1091,19 @@ def project_ir_to_hwpx(
     title_sz_hu = max(900, body_sz_hu - 100)
     cover_sz_hu = int(round(body_sz_hu * 1.8))
 
-    cs_list: List[Tuple[int, bool, bool, str]] = [
-        (body_sz_hu, False, False, "000000"),
-        (body_sz_hu, True, False, "000000"),
-        (tbl_sz_hu, False, False, "000000"),
-        (tbl_sz_hu, True, False, "000000"),
-        (title_sz_hu, True, False, "FFFFFF"),
-        (tbl_sz_hu, False, False, "333333"),
-        (cover_sz_hu, True, False, "3A3C84"),
+    cs_list: List[Tuple[int, bool, bool, bool, str]] = [
+        (body_sz_hu, False, False, False, "000000"),
+        (body_sz_hu, True, False, False, "000000"),
+        (tbl_sz_hu, False, False, False, "000000"),
+        (tbl_sz_hu, True, False, False, "000000"),
+        (title_sz_hu, True, False, False, "FFFFFF"),
+        (tbl_sz_hu, False, False, False, "333333"),
+        (cover_sz_hu, True, False, False, "3A3C84"),
     ]
     cs_map = {k: idx for idx, k in enumerate(cs_list)}
 
-    def get_hwpx_cs(height_hu: int, bold: bool, italic: bool, color_hex: str) -> int:
-        key = (height_hu, bold, italic, color_hex.upper())
+    def get_hwpx_cs(height_hu: int, bold: bool, italic: bool, underline: bool, color_hex: str) -> int:
+        key = (height_hu, bold, italic, underline, color_hex.upper())
         if key not in cs_map:
             cs_map[key] = len(cs_list)
             cs_list.append(key)
@@ -1020,13 +1123,13 @@ def project_ir_to_hwpx(
         for blk in blocks:
             if blk["type"] == "p":
                 for r in blk["runs"]:
-                    get_hwpx_cs(body_sz_hu, r["bold"], r["italic"], r["color"])
+                    get_hwpx_cs(body_sz_hu, r["bold"], r["italic"], bool(r.get("underline", False)), r["color"])
             elif blk["type"] == "tbl":
                 for cell in blk["cells"]:
                     get_hwpx_bf(cell["fill_hex"])
                     for p in cell["paras"]:
                         for r in p["runs"]:
-                            get_hwpx_cs(tbl_sz_hu, r["bold"], r["italic"], r["color"])
+                            get_hwpx_cs(tbl_sz_hu, r["bold"], r["italic"], bool(r.get("underline", False)), r["color"])
 
     def render_hwpx_p(p_blk: dict, height_hu: int, id_counter: List[int]) -> str:
         id_counter[0] += 1
@@ -1035,7 +1138,7 @@ def project_ir_to_hwpx(
         ps_id = {"JUSTIFY": 0, "LEFT": 1, "CENTER": 2, "RIGHT": 3}.get(jc_map.get(p_blk["jc"], "JUSTIFY"), 0)
         runs_xml: List[str] = []
         for r in p_blk["runs"]:
-            cid = get_hwpx_cs(height_hu, r["bold"], r["italic"], r["color"])
+            cid = get_hwpx_cs(height_hu, r["bold"], r["italic"], bool(r.get("underline", False)), r["color"])
             runs_xml.append(f'<hp:run charPrIDRef="{cid}"><hp:t>{xml_esc(r["text"])}</hp:t></hp:run>')
         if not runs_xml:
             runs_xml.append('<hp:run charPrIDRef="0"><hp:t></hp:t></hp:run>')
@@ -1260,9 +1363,10 @@ def project_ir_to_hwpx(
             )
 
     cs_xml_items: List[str] = []
-    for cid, (h_hu, b_flag, i_flag, col_hex) in enumerate(cs_list):
+    for cid, (h_hu, b_flag, i_flag, u_flag, col_hex) in enumerate(cs_list):
         b_tag = "<hh:bold/>" if b_flag else ""
         i_tag = "<hh:italic/>" if i_flag else ""
+        u_type = "BOTTOM" if u_flag else "NONE"
         cs_xml_items.append(
             f'<hh:charPr id="{cid}" height="{h_hu}" textColor="#{col_hex}" shadeColor="none" useFontSpace="0" useKerning="0" symMark="NONE" borderFillIDRef="1">'
             '<hh:fontRef hangul="0" latin="0" hanja="0" japanese="0" other="0" symbol="0" user="0"/>'
@@ -1271,7 +1375,7 @@ def project_ir_to_hwpx(
             '<hh:relSz hangul="100" latin="100" hanja="100" japanese="100" other="100" symbol="100" user="100"/>'
             '<hh:offset hangul="0" latin="0" hanja="0" japanese="0" other="0" symbol="0" user="0"/>'
             f"{b_tag}{i_tag}"
-            '<hh:underline type="NONE" shape="SOLID" color="#000000"/>'
+            f'<hh:underline type="{u_type}" shape="SOLID" color="#{col_hex}"/>'
             '<hh:strikeout shape="NONE" color="#000000"/>'
             '<hh:outline type="NONE"/>'
             '<hh:shadow type="NONE" color="#C0C0C0" offsetX="10" offsetY="10"/>'

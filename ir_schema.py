@@ -1,6 +1,6 @@
 """
-T-DIR v3.0 Universal Document Intermediate Representation Schema, Dynamic Spec Resolver,
-and Cryptographic Text Immutability Verifier.
+T-DIR v3.1 Universal Document Intermediate Representation Schema, Dynamic Spec Resolver,
+Mixed-Script Width Estimator, Bipartite Slot Matcher, and Cryptographic Verifier.
 Zero hardcoded font names or pixel/HWPUNIT constants: all typography and geometry are
 resolved via the priority chain:
   1. UserSpecOverrideIR (Explicit user/MCP specification)
@@ -8,9 +8,11 @@ resolved via the priority chain:
   3. SourceDocumentSpecIR (Dynamically extracted from source document file)
 """
 
+import re
 import copy
 import hashlib
-from dataclasses import dataclass, field, asdict
+import unicodedata
+from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
 
 
@@ -40,6 +42,87 @@ def mm_to_hu(mm_val: float) -> int:
 
 def hu_to_emu(hu_val: int) -> int:
     return int(round(hu_val * 127.0))
+
+
+def detect_image_format(raw_bytes: bytes) -> Tuple[str, str]:
+    """
+    Detects physical image format extension and MIME type from binary magic bytes ([BUG-04]).
+    """
+    if raw_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png", "image/png"
+    if raw_bytes.startswith(b"\xff\xd8\xff"):
+        return "jpg", "image/jpeg"
+    if raw_bytes.startswith((b"GIF87a", b"GIF89a")):
+        return "gif", "image/gif"
+    if raw_bytes.startswith(b"BM"):
+        return "bmp", "image/bmp"
+    return "png", "image/png"
+
+
+def compute_weighted_text_units(txt: str) -> float:
+    """
+    Computes East-Asian-Width weighted character units ([EDGE-04]):
+      - Fullwidth / Wide CJK ('F', 'W'): 1.00 unit
+      - Whitespace: 0.35 unit
+      - Halfwidth / Narrow ASCII alphanumeric & symbols: 0.56 unit
+    """
+    total = 0.0
+    for ch in txt:
+        if ch.isspace():
+            total += 0.35
+        elif unicodedata.east_asian_width(ch) in ("F", "W"):
+            total += 1.00
+        else:
+            total += 0.56
+    return total
+
+
+def extract_ordinal_index(text: str) -> Optional[int]:
+    """
+    Extracts leading ordinal index from section headings or slot titles
+    (e.g. 'Q1.', '1.', '제2장', '[3]', 'Ⅰ.', 'Ⅱ.').
+    """
+    s = text.strip()
+    m_q = re.match(r"^[Qq]\s*(\d+)\b", s)
+    if m_q:
+        return int(m_q.group(1))
+    m_num = re.match(r"^[\[<\(]?\s*(\d+)\s*[\.\]\>\)]", s)
+    if m_num:
+        return int(m_num.group(1))
+    m_ch = re.match(r"^제\s*(\d+)\s*[장절항문]", s)
+    if m_ch:
+        return int(m_ch.group(1))
+    roman_map = {"Ⅰ": 1, "Ⅱ": 2, "Ⅲ": 3, "Ⅳ": 4, "Ⅴ": 5, "I.": 1, "II.": 2, "III.": 3, "IV.": 4}
+    for rk, rv in roman_map.items():
+        if s.startswith(rk):
+            return rv
+    return None
+
+
+def compute_heading_slot_similarity(heading_txt: str, slot_title_txt: str, slot_uid: str = "") -> float:
+    """
+    Domain-agnostic similarity score between a source section heading and a target slot title ([GEN-02]).
+    Combines ordinal index alignment with character 2-gram Jaccard similarity.
+    """
+    ord_h = extract_ordinal_index(heading_txt)
+    ord_s = extract_ordinal_index(slot_title_txt) or extract_ordinal_index(slot_uid)
+    if ord_h is not None and ord_s is not None:
+        if ord_h != ord_s:
+            return 0.0
+        base_score = 0.70
+    else:
+        base_score = 0.0
+
+    norm_h = re.sub(r"[\s\W_]+", "", heading_txt.lower())
+    norm_s = re.sub(r"[\s\W_]+", "", slot_title_txt.lower())
+    if not norm_h or not norm_s:
+        return base_score
+
+    grams_h = {norm_h[i : i + 2] for i in range(max(1, len(norm_h) - 1))}
+    grams_s = {norm_s[i : i + 2] for i in range(max(1, len(norm_s) - 1))}
+    union_len = len(grams_h | grams_s)
+    jaccard = (len(grams_h & grams_s) / float(union_len)) if union_len > 0 else 0.0
+    return min(1.0, base_score + 0.30 * jaccard)
 
 
 @dataclass
@@ -165,6 +248,7 @@ class TargetDocumentSpecIR:
     margin_right_hu: int = 0
     margin_header_hu: int = 0
     margin_footer_hu: int = 0
+    margins_explicitly_overridden: bool = False
     body_font_family: str = ""
     table_font_family: str = ""
     body_font_size_hu: int = 0
@@ -203,12 +287,14 @@ class UserSpecOverrideIR:
     route_media_to_attachment_slots: bool = True
     max_attachment_images: Optional[int] = None
     attachment_captions: List[str] = field(default_factory=list)
+    allow_font_size_elastic_scaling: bool = False
+    clear_unmapped_slots: bool = False
+    style_inheritance_mode: str = "TARGET_STRICT"
 
     @classmethod
     def from_dict(cls, d: Optional[dict]) -> "UserSpecOverrideIR":
         if not d:
             return cls()
-        # Support legacy alias 'page_budgets' -> 'section_page_budgets'
         sec_budgets = dict(d.get("section_page_budgets") or d.get("page_budgets") or {})
         return cls(
             body_font_family=d.get("body_font_family") or d.get("font_family"),
@@ -241,6 +327,9 @@ class UserSpecOverrideIR:
                 int(d["max_attachment_images"]) if d.get("max_attachment_images") is not None else None
             ),
             attachment_captions=list(d.get("attachment_captions") or []),
+            allow_font_size_elastic_scaling=bool(d.get("allow_font_size_elastic_scaling", False)),
+            clear_unmapped_slots=bool(d.get("clear_unmapped_slots", False)),
+            style_inheritance_mode=str(d.get("style_inheritance_mode", "TARGET_STRICT")),
         )
 
 
@@ -322,6 +411,7 @@ def resolve_effective_document_spec(
         eff.page_height_hu = mm_to_hu(297.0)
 
     if user_overrides.margins_mm:
+        eff.margins_explicitly_overridden = True
         if "top" in user_overrides.margins_mm:
             eff.margin_top_hu = mm_to_hu(user_overrides.margins_mm["top"])
         if "bottom" in user_overrides.margins_mm:
