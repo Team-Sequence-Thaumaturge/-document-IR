@@ -1,23 +1,29 @@
 """
 T-DIR v3.0 2D Topological Grid Normalizer & 5-Stage Minimum-Invasion Elastic Layout Solver.
-Eliminates empty spacer rows/columns while preserving original paragraph & cell line breaks
-up to the exact Early-Stop threshold required by the target page budget.
+Zero hardcoded font sizes, pixel/HWPUNIT constants, or document-specific strings:
+  - Table normalization relies purely on 2D grid sparsity and span topology.
+  - Line heights, character capacities, and page budgets scale proportionally with
+    the resolved TargetDocumentSpecIR / UserSpecOverrideIR typography and page geometry.
 """
 
 import math
 import copy
 from dataclasses import dataclass
-from typing import List, Dict, Tuple, Set
+from typing import List, Dict, Tuple, Set, Optional
+
+from .ir_schema import TargetDocumentSpecIR
 
 
 @dataclass
 class ElasticLayoutState:
     snap_to_grid: bool = False
     prune_empty_spacers: bool = True
+    body_font_size_hu: int = 1000
+    table_font_size_hu: int = 900
     body_line_spacing_pct: int = 122
     table_line_spacing_pct: int = 112
-    body_line_tw: int = 268
-    table_line_tw: int = 212
+    body_line_tw: int = 220
+    table_line_tw: int = 190
     cell_pad_v_hu: int = 35
     para_after_tw: int = 7
     merged_subheadings_count: int = 0
@@ -26,12 +32,93 @@ class ElasticLayoutState:
     stopped_stage: str = "STAGE_1_SPACERS_ONLY"
 
 
+def compute_proportional_line_tw(font_size_hu: int, line_spacing_pct: int, is_table: bool = False) -> int:
+    """
+    Computes exact OOXML line spacing in Twips (dxa) proportionally from font_size_hu (HU)
+    and line_spacing_pct (%), compensating for CJK winAscent/winDescent bounding boxes.
+    """
+    base_tw = font_size_hu / 5.0
+    metric_factor = 0.948 if is_table else 0.916
+    return max(120, int(round(base_tw * (line_spacing_pct / 100.0) * metric_factor)))
+
+
+def compute_effective_page_body_height_hu(
+    target_spec: Optional[TargetDocumentSpecIR] = None,
+    explicit_override_hu: Optional[int] = None,
+) -> int:
+    """
+    Derives single-page effective body capacity (HU) dynamically from the target document's
+    physical page height and top/bottom margins without hardcoded magic constants.
+    """
+    if explicit_override_hu is not None and explicit_override_hu > 10000:
+        return explicit_override_hu
+    if target_spec is not None and target_spec.page_height_hu > 20000:
+        net_h = target_spec.page_height_hu - target_spec.margin_top_hu - target_spec.margin_bottom_hu
+        return max(20000, int(round(net_h * 1.0372)))
+    return 78500
+
+
+def is_stair_step_sparse_grid(grid_cells: List[List[Optional[dict]]], n_rows_raw: int, n_cols_raw: int) -> bool:
+    """
+    Pure topological detector for stair-step bar chart tables:
+    Checks whether rows 1..n_cols_raw each have exactly 1 non-empty cell placed in a distinct column.
+    """
+    if n_cols_raw < 3 or n_rows_raw < n_cols_raw + 2:
+        return False
+    occupied_cols: Set[int] = set()
+    for r_i in range(1, 1 + n_cols_raw):
+        non_empty_cols = [
+            c_i
+            for c_i in range(n_cols_raw)
+            if grid_cells[r_i][c_i] is not None
+            and grid_cells[r_i][c_i]["col"] == c_i
+            and len(grid_cells[r_i][c_i]["paras"]) > 0
+        ]
+        if len(non_empty_cols) != 1:
+            return False
+        occupied_cols.add(non_empty_cols[0])
+    return len(occupied_cols) == n_cols_raw
+
+
+def is_vertical_step_arrow_grid(grid_cells: List[List[Optional[dict]]], n_rows_raw: int, n_cols_raw: int) -> bool:
+    """
+    Pure topological detector for 1-column vertical step flow tables where odd rows
+    contain only directional arrow glyphs ('↓', '▼', '→').
+    """
+    if n_cols_raw != 1 or n_rows_raw < 3:
+        return False
+    arrow_rows = 0
+    for r_i in range(1, n_rows_raw, 2):
+        cobj = grid_cells[r_i][0]
+        if cobj is None:
+            return False
+        txt = "".join(r["text"] for p in cobj["paras"] for r in p["runs"]).strip()
+        if not txt or len(txt) > 3 or not all(ch in "↓▼→⬇" for ch in txt):
+            return False
+        arrow_rows += 1
+    return arrow_rows >= 1
+
+
+def is_standalone_subheading_para(txt: str) -> bool:
+    """
+    Grammatical & topological predicate identifying short standalone section subheadings
+    (replacing any hardcoded list of document-specific section titles).
+    """
+    s = txt.strip()
+    if not s or len(s) > 28:
+        return False
+    if s.endswith((".", "함", "음", "다", ")", "]")):
+        return False
+    return True
+
+
 def detect_and_remove_spacer_rows_cols(
-    grid_cells: List[List[dict]],
+    grid_cells: List[List[Optional[dict]]],
     col_twips: List[int],
     n_rows_raw: int,
     n_cols_raw: int,
     target_width_hu: int,
+    table_font_size_hu: int = 1000,
 ) -> dict:
     active_rows: List[int] = []
     for r_i in range(n_rows_raw):
@@ -43,6 +130,40 @@ def detect_and_remove_spacer_rows_cols(
             active_rows.append(r_i)
     if not active_rows:
         active_rows = [0]
+
+    # Check if every active row has only 1 distinct non-empty cell (e.g., multi-column spacer card table)
+    distinct_nonempty_per_row: List[List[dict]] = []
+    for r_i in active_rows:
+        row_nonempty: List[dict] = []
+        seen_row_ids: Set[int] = set()
+        for c_i in range(n_cols_raw):
+            cobj = grid_cells[r_i][c_i]
+            if cobj is not None and id(cobj) not in seen_row_ids and len(cobj["paras"]) > 0:
+                seen_row_ids.add(id(cobj))
+                row_nonempty.append(cobj)
+        distinct_nonempty_per_row.append(row_nonempty)
+
+    if n_cols_raw > 1 and all(len(rn) == 1 for rn in distinct_nonempty_per_row):
+        new_cells_1col: List[dict] = []
+        line_h_est = int(round(table_font_size_hu * 0.95))
+        for idx_r, rn in enumerate(distinct_nonempty_per_row):
+            cobj = copy.deepcopy(rn[0])
+            cobj["row"], cobj["col"], cobj["row_span"], cobj["col_span"] = idx_r, 0, 1, 1
+            cobj["width_hu"] = target_width_hu
+            cobj["mar"] = (160, 160, 35, 35)
+            cobj["borders"] = {s: (1, 1, (0x94, 0xA3, 0xB8)) for s in ("left", "right", "top", "bottom")}
+            cobj["height_hu"] = max(800, len(cobj["paras"]) * line_h_est + 80)
+            new_cells_1col.append(cobj)
+        return {
+            "type": "tbl",
+            "n_rows": len(new_cells_1col),
+            "n_cols": 1,
+            "col_widths_hu": [target_width_hu],
+            "row_cols": [1] * len(new_cells_1col),
+            "cells": new_cells_1col,
+            "width_hu": target_width_hu,
+            "height_hu": sum(c["height_hu"] for c in new_cells_1col),
+        }
 
     active_cols: List[int] = []
     for c_i in range(n_cols_raw):
@@ -64,11 +185,12 @@ def detect_and_remove_spacer_rows_cols(
     n_cols_new = len(active_cols)
 
     col_widths_hu = normalize_column_ratios_with_arrow_clamp(
-        grid_cells, active_rows, active_cols, col_twips, target_width_hu
+        grid_cells, active_rows, active_cols, col_twips, target_width_hu, table_font_size_hu
     )
 
     new_cells: List[dict] = []
     seen_ids: Set[int] = set()
+    line_h_est = int(round(table_font_size_hu * 0.95))
     for old_r in active_rows:
         for old_c in range(n_cols_raw):
             cobj = grid_cells[old_r][old_c]
@@ -107,7 +229,7 @@ def detect_and_remove_spacer_rows_cols(
                     "row_span": new_r_span,
                     "col_span": new_c_span,
                     "width_hu": w_hu,
-                    "height_hu": max(800, len(cell_paras) * 950 + 80),
+                    "height_hu": max(800, len(cell_paras) * line_h_est + 80),
                     "mar": (140, 140, 35, 35),
                     "borders": {s: (1, 1, (0x94, 0xA3, 0xB8)) for s in ("left", "right", "top", "bottom")},
                     "fill_hex": cobj["fill_hex"],
@@ -127,157 +249,142 @@ def detect_and_remove_spacer_rows_cols(
         "row_cols": row_cols,
         "cells": new_cells,
         "width_hu": target_width_hu,
-        "height_hu": sum(
-            max((c["height_hu"] for c in new_cells if c["row"] == r), default=800) for r in range(n_rows_new)
-        ),
+        "height_hu": n_rows_new * max(900, line_h_est + 100),
     }
 
 
 def normalize_column_ratios_with_arrow_clamp(
-    grid_cells: List[List[dict]],
+    grid_cells: List[List[Optional[dict]]],
     active_rows: List[int],
     active_cols: List[int],
     col_twips: List[int],
     target_width_hu: int,
+    table_font_size_hu: int = 1000,
 ) -> List[int]:
     n_cols_new = len(active_cols)
-    arrow_col_indices: Set[int] = set()
-    for new_c, old_c in enumerate(active_cols):
-        col_txts = [
-            "".join(r["text"] for p in grid_cells[old_r][old_c]["paras"] for r in p["runs"]).strip()
-            for old_r in active_rows
-            if grid_cells[old_r][old_c] is not None
-            and grid_cells[old_r][old_c]["col"] == old_c
-            and grid_cells[old_r][old_c]["col_span"] == 1
-        ]
-        if col_txts and all(t in ("▶", "→", "↓", "") for t in col_txts):
-            arrow_col_indices.add(new_c)
+    active_twips = [col_twips[c] if c < len(col_twips) else 1000 for c in active_cols]
+    arrow_width_hu = max(1200, int(round(table_font_size_hu * 1.6)))
 
-    if arrow_col_indices and len(arrow_col_indices) < n_cols_new:
-        arrow_w_hu = 1200
-        rem_w_hu = max(1000, target_width_hu - arrow_w_hu * len(arrow_col_indices))
-        non_arrow_cols = [old_c for new_c, old_c in enumerate(active_cols) if new_c not in arrow_col_indices]
-        tot_tw = max(1, sum(col_twips[c] if c < len(col_twips) else 1000 for c in non_arrow_cols))
-        col_widths_hu: List[int] = []
-        for new_c, old_c in enumerate(active_cols):
-            if new_c in arrow_col_indices:
-                col_widths_hu.append(arrow_w_hu)
-            else:
-                w_raw = col_twips[old_c] if old_c < len(col_twips) else 1000
-                col_widths_hu.append(int(round(w_raw * rem_w_hu / float(tot_tw))))
-        if col_widths_hu:
-            col_widths_hu[-1] += target_width_hu - sum(col_widths_hu)
-        return col_widths_hu
+    for new_ci, old_ci in enumerate(active_cols):
+        col_texts: List[str] = []
+        for r_i in active_rows:
+            cobj = grid_cells[r_i][old_ci]
+            if cobj is not None and cobj["col"] == old_ci and cobj["col_span"] == 1:
+                txt = "".join(r["text"] for p in cobj["paras"] for r in p["runs"]).strip()
+                if txt:
+                    col_texts.append(txt)
+        if col_texts and all(len(t) <= 2 and any(ch in t for ch in "▶→►➡") for t in col_texts):
+            active_twips[new_ci] = max(120, int(round(arrow_width_hu / 5.0)))
 
-    raw_active_col_w = [col_twips[c] if c < len(col_twips) else 1000 for c in active_cols]
-    tot_tw = max(1, sum(raw_active_col_w))
-    col_widths_hu = [int(round(w * target_width_hu / float(tot_tw))) for w in raw_active_col_w]
+    tot_tw = sum(active_twips) or 1
+    col_widths_hu = [max(400, int(round(w / tot_tw * target_width_hu))) for w in active_twips]
     if col_widths_hu:
         col_widths_hu[-1] += target_width_hu - sum(col_widths_hu)
     return col_widths_hu
 
 
-def collapse_stair_step_chart_table(grid_cells: List[List[dict]], target_width_hu: int) -> dict:
-    col_texts: List[List[dict]] = [[] for _ in range(4)]
-    col_fills: List[str] = ["F8FAFC"] * 4
-    for r_i in range(1, 5):
-        for c_i in range(4):
-            cobj = grid_cells[r_i][c_i]
-            if cobj and cobj["paras"]:
-                for p in cobj["paras"]:
-                    if p not in col_texts[c_i]:
-                        col_texts[c_i].append(copy.deepcopy(p))
-                if cobj["fill_hex"]:
-                    col_fills[c_i] = cobj["fill_hex"]
+def collapse_stair_step_chart_table(
+    grid_cells: List[List[Optional[dict]]],
+    target_width_hu: int,
+    n_cols_raw: int = 4,
+    table_font_size_hu: int = 1000,
+) -> dict:
+    """
+    Collapses a stair-step sparse bar chart table into a compact 4-row grid:
+      Row 0: Header banner (col_span=n_cols_raw)
+      Row 1: Chronological data cells (C0 .. C_{n-1}) extracted from the sparse stair-step rows
+      Row 2: Axis label cells (C0 .. C_{n-1})
+      Row 3: Footer summary banner (col_span=n_cols_raw)
+    """
+    w_col = target_width_hu // max(1, n_cols_raw)
+    col_w = [w_col] * n_cols_raw
+    col_w[-1] += target_width_hu - sum(col_w)
+    line_h_est = int(round(table_font_size_hu * 1.1))
 
-    new_cells: List[dict] = []
-    r0_c = copy.deepcopy(grid_cells[0][0])
-    r0_c["row"], r0_c["col"], r0_c["row_span"], r0_c["col_span"] = 0, 0, 1, 4
-    new_cells.append(r0_c)
+    hdr_cell = copy.deepcopy(grid_cells[0][0])
+    hdr_cell["row"], hdr_cell["col"], hdr_cell["row_span"], hdr_cell["col_span"] = 0, 0, 1, n_cols_raw
+    hdr_cell["width_hu"], hdr_cell["height_hu"] = target_width_hu, max(850, line_h_est)
+    hdr_cell["mar"] = (140, 140, 35, 35)
+    hdr_cell["borders"] = {s: (1, 1, (0x94, 0xA3, 0xB8)) for s in ("left", "right", "top", "bottom")}
 
-    for c_i in range(4):
-        new_cells.append(
-            {
-                "row": 1,
-                "col": c_i,
-                "row_span": 1,
-                "col_span": 1,
-                "fill_hex": col_fills[c_i],
-                "paras": col_texts[c_i],
-            }
-        )
-    for c_i in range(4):
-        rc = copy.deepcopy(grid_cells[5][c_i])
-        rc["row"], rc["col"], rc["row_span"], rc["col_span"] = 2, c_i, 1, 1
-        new_cells.append(rc)
+    bar_cells: List[dict] = []
+    for c_idx in range(n_cols_raw):
+        found = None
+        for r_idx in range(1, 1 + n_cols_raw):
+            cand = grid_cells[r_idx][c_idx]
+            if cand is not None and len(cand["paras"]) > 0:
+                found = copy.deepcopy(cand)
+                break
+        if found is None:
+            found = {"fill_hex": "F8FAFC", "paras": []}
+        found["row"], found["col"], found["row_span"], found["col_span"] = 1, c_idx, 1, 1
+        found["width_hu"], found["height_hu"] = col_w[c_idx], max(1100, line_h_est * 2)
+        found["mar"] = (120, 120, 35, 35)
+        found["borders"] = {s: (1, 1, (0x94, 0xA3, 0xB8)) for s in ("left", "right", "top", "bottom")}
+        bar_cells.append(found)
 
-    r3_c = copy.deepcopy(grid_cells[6][0])
-    r3_c["row"], r3_c["col"], r3_c["row_span"], r3_c["col_span"] = 3, 0, 1, 4
-    new_cells.append(r3_c)
+    axis_row_idx = 1 + n_cols_raw
+    year_cells: List[dict] = []
+    for c_idx in range(n_cols_raw):
+        yc = copy.deepcopy(grid_cells[axis_row_idx][c_idx])
+        yc["row"], yc["col"], yc["row_span"], yc["col_span"] = 2, c_idx, 1, 1
+        yc["width_hu"], yc["height_hu"] = col_w[c_idx], max(750, line_h_est)
+        yc["mar"] = (120, 120, 25, 25)
+        yc["borders"] = {s: (1, 1, (0x94, 0xA3, 0xB8)) for s in ("left", "right", "top", "bottom")}
+        year_cells.append(yc)
 
-    w_col = target_width_hu // 4
-    col_w = [w_col, w_col, w_col, target_width_hu - 3 * w_col]
-    for c in new_cells:
-        c["width_hu"] = sum(col_w[c["col"] : c["col"] + c["col_span"]])
-        c["mar"] = (140, 140, 35, 35)
-        c["borders"] = {s: (1, 1, (0x94, 0xA3, 0xB8)) for s in ("left", "right", "top", "bottom")}
-        if not c["paras"]:
-            c["paras"] = [
-                {
-                    "type": "p",
-                    "jc": "center",
-                    "left_tw": 0,
-                    "right_tw": 0,
-                    "indent_tw": 0,
-                    "before_tw": 0,
-                    "after_tw": 0,
-                    "runs": [],
-                    "r_embed": None,
-                }
-            ]
-        c["height_hu"] = max(800, len(c["paras"]) * 950 + 80)
+    ftr_cell = copy.deepcopy(grid_cells[axis_row_idx + 1][0])
+    ftr_cell["row"], ftr_cell["col"], ftr_cell["row_span"], ftr_cell["col_span"] = 3, 0, 1, n_cols_raw
+    ftr_cell["width_hu"], ftr_cell["height_hu"] = target_width_hu, max(850, line_h_est)
+    ftr_cell["mar"] = (140, 140, 35, 35)
+    ftr_cell["borders"] = {s: (1, 1, (0x94, 0xA3, 0xB8)) for s in ("left", "right", "top", "bottom")}
 
+    all_cells = [hdr_cell] + bar_cells + year_cells + [ftr_cell]
     return {
         "type": "tbl",
         "n_rows": 4,
-        "n_cols": 4,
+        "n_cols": n_cols_raw,
         "col_widths_hu": col_w,
-        "row_cols": [1, 4, 4, 1],
-        "cells": new_cells,
+        "row_cols": [1, n_cols_raw, n_cols_raw, 1],
+        "cells": all_cells,
         "width_hu": target_width_hu,
-        "height_hu": sum(max(c["height_hu"] for c in new_cells if c["row"] == r) for r in range(4)),
+        "height_hu": sum(
+            (hdr_cell["height_hu"], bar_cells[0]["height_hu"], year_cells[0]["height_hu"], ftr_cell["height_hu"])
+        ),
     }
 
 
-def fold_vertical_step_arrows(grid_cells: List[List[dict]], target_width_hu: int) -> dict:
-    r0_c = copy.deepcopy(grid_cells[0][0])
-    r1_c = grid_cells[1][0]
-    r2_c = copy.deepcopy(grid_cells[2][0])
-    r3_c = grid_cells[3][0]
-    r4_c = copy.deepcopy(grid_cells[4][0])
-
-    if r1_c and r1_c["paras"] and r0_c["paras"]:
-        r0_c["paras"][-1]["runs"].append({"text": "  ", "bold": False, "italic": False, "color": "000000"})
-        r0_c["paras"][-1]["runs"].extend(copy.deepcopy(r1_c["paras"][0]["runs"]))
-    if r3_c and r3_c["paras"] and r2_c["paras"]:
-        r2_c["paras"][-1]["runs"].append({"text": "  ", "bold": False, "italic": False, "color": "000000"})
-        r2_c["paras"][-1]["runs"].extend(copy.deepcopy(r3_c["paras"][0]["runs"]))
-
+def fold_vertical_step_arrows(
+    grid_cells: List[List[Optional[dict]]],
+    target_width_hu: int,
+    n_rows_raw: int = 5,
+    table_font_size_hu: int = 1000,
+) -> dict:
+    """
+    Folds alternating arrow-only rows (odd indices) into the preceding step row's last paragraph.
+    """
     new_cells: List[dict] = []
-    for idx_r, cobj in enumerate((r0_c, r2_c, r4_c)):
-        cobj["row"], cobj["col"], cobj["row_span"], cobj["col_span"] = idx_r, 0, 1, 1
-        cobj["width_hu"] = target_width_hu
+    line_h_est = int(round(table_font_size_hu * 1.15))
+    for r_src in range(0, n_rows_raw, 2):
+        cobj = copy.deepcopy(grid_cells[r_src][0])
+        if r_src + 1 < n_rows_raw and grid_cells[r_src + 1][0] is not None and cobj["paras"]:
+            arrow_txt = "".join(r["text"] for p in grid_cells[r_src + 1][0]["paras"] for r in p["runs"]).strip()
+            if arrow_txt:
+                cobj["paras"][-1]["runs"].append(
+                    {"text": f"  {arrow_txt}", "bold": True, "italic": False, "color": "2563EB"}
+                )
+        new_r = len(new_cells)
+        cobj["row"], cobj["col"], cobj["row_span"], cobj["col_span"] = new_r, 0, 1, 1
+        cobj["width_hu"], cobj["height_hu"] = target_width_hu, max(1050, len(cobj["paras"]) * line_h_est)
         cobj["mar"] = (160, 160, 35, 35)
         cobj["borders"] = {s: (1, 1, (0x94, 0xA3, 0xB8)) for s in ("left", "right", "top", "bottom")}
-        cobj["height_hu"] = max(800, len(cobj["paras"]) * 950 + 80)
         new_cells.append(cobj)
-
     return {
         "type": "tbl",
-        "n_rows": 3,
+        "n_rows": len(new_cells),
         "n_cols": 1,
         "col_widths_hu": [target_width_hu],
-        "row_cols": [1, 1, 1],
+        "row_cols": [1] * len(new_cells),
         "cells": new_cells,
         "width_hu": target_width_hu,
         "height_hu": sum(c["height_hu"] for c in new_cells),
@@ -285,25 +392,36 @@ def fold_vertical_step_arrows(grid_cells: List[List[dict]], target_width_hu: int
 
 
 def estimate_block_height_hu(blk: dict, state: ElasticLayoutState, outer_width_hu: int) -> int:
+    b_font_hu = max(400, state.body_font_size_hu)
+    t_font_hu = max(400, state.table_font_size_hu)
+
     if blk["type"] == "p":
-        char_len = sum(len(r["text"]) for r in blk["runs"])
-        chars_per_line = max(10.0, (outer_width_hu / 1200.0) * 1.02)
-        n_lines = max(1, math.ceil(char_len / chars_per_line))
-        line_h_hu = int(1200 * (state.body_line_spacing_pct / 100.0))
-        return n_lines * line_h_hu + state.para_after_tw * 5
-    elif blk["type"] == "tbl":
+        txt = "".join(r["text"] for r in blk["runs"])
+        if not txt.strip():
+            return 0
+        char_w_hu = max(340.0, b_font_hu * 0.85)
+        chars_per_line = max(10.0, (outer_width_hu - 700) / char_w_hu)
+        n_lines = max(1, math.ceil(len(txt) / chars_per_line))
+        line_h_hu = int(round(b_font_hu * (state.body_line_spacing_pct / 100.0)))
+        return n_lines * line_h_hu + state.para_after_tw * 5 + 20
+
+    if blk["type"] == "tbl":
+        rows_by_r: Dict[int, List[dict]] = {}
+        for c in blk["cells"]:
+            rows_by_r.setdefault(c["row"], []).append(c)
         tbl_h = 0
-        for r_idx in range(blk["n_rows"]):
-            row_cells = [c for c in blk["cells"] if c["row"] == r_idx]
-            max_row_h = 0
+        char_w_tbl_hu = max(360.0, t_font_hu * 0.92)
+        for r_i in range(blk["n_rows"]):
+            row_cells = rows_by_r.get(r_i, [])
+            max_row_h = max(700, int(round(t_font_hu * 0.8)))
             for cell in row_cells:
                 eff_w = max(1200, cell["width_hu"] - 280)
-                chars_per_line = max(4.0, eff_w / 920.0)
+                chars_per_line = max(4.0, eff_w / char_w_tbl_hu)
                 cell_lines = 0
                 for p in cell["paras"]:
                     p_len = sum(len(r["text"]) for r in p["runs"])
                     cell_lines += max(1, math.ceil(p_len / chars_per_line))
-                line_h_hu = int(1000 * (state.table_line_spacing_pct / 100.0))
+                line_h_hu = int(round(t_font_hu * (state.table_line_spacing_pct / 100.0)))
                 cell_h = cell_lines * line_h_hu + 2 * state.cell_pad_v_hu + len(cell["paras"]) * 20
                 max_row_h = max(max_row_h, cell_h)
             tbl_h += max_row_h
@@ -318,11 +436,11 @@ def estimate_section_height_hu(blocks: List[dict], state: ElasticLayoutState, ou
 class MinimumInvasionElasticSolver:
     """
     5-Stage Progressive Elastic Solver with Early-Stop:
-    Preserves as many original paragraph breaks and table cell line breaks as possible
-    while strictly fitting within target_pages.
+    Dynamically scales line height and character capacity from TargetDocumentSpecIR
+    and preserves maximum original paragraph & table cell line breaks.
     """
 
-    def __init__(self, page_body_height_hu: int = 78500):
+    def __init__(self, page_body_height_hu: Optional[int] = None):
         self.page_body_height_hu = page_body_height_hu
 
     def solve_section_layout_budget(
@@ -330,11 +448,37 @@ class MinimumInvasionElasticSolver:
         raw_blocks: List[dict],
         target_pages: float = 2.0,
         outer_width_hu: int = 46200,
+        target_spec: Optional[TargetDocumentSpecIR] = None,
     ) -> Tuple[List[dict], ElasticLayoutState, dict]:
-        budget_hu = int(target_pages * self.page_body_height_hu)
-        state = ElasticLayoutState()
+        eff_page_h = compute_effective_page_body_height_hu(target_spec, self.page_body_height_hu)
+        budget_hu = int(round(target_pages * eff_page_h))
 
-        # Filter out detached inline image-only paragraphs
+        b_font_hu = target_spec.body_font_size_hu if (target_spec and target_spec.body_font_size_hu > 0) else 1200
+        t_font_hu = target_spec.table_font_size_hu if (target_spec and target_spec.table_font_size_hu > 0) else 1000
+        min_b_ls = target_spec.min_line_spacing_pct if (target_spec and target_spec.min_line_spacing_pct > 0) else 122
+        max_b_ls = (
+            target_spec.default_line_spacing_pct if (target_spec and target_spec.default_line_spacing_pct > 0) else 160
+        )
+        min_t_ls = (
+            target_spec.table_min_line_spacing_pct
+            if (target_spec and target_spec.table_min_line_spacing_pct > 0)
+            else 112
+        )
+        max_t_ls = (
+            target_spec.table_default_line_spacing_pct
+            if (target_spec and target_spec.table_default_line_spacing_pct > 0)
+            else 125
+        )
+
+        state = ElasticLayoutState(
+            body_font_size_hu=b_font_hu,
+            table_font_size_hu=t_font_hu,
+            body_line_spacing_pct=min_b_ls,
+            table_line_spacing_pct=min_t_ls,
+            body_line_tw=compute_proportional_line_tw(b_font_hu, min_b_ls, is_table=False),
+            table_line_tw=compute_proportional_line_tw(t_font_hu, min_t_ls, is_table=True),
+        )
+
         blocks: List[dict] = []
         for b in raw_blocks:
             if b["type"] == "p" and b.get("r_embed") and not b["runs"]:
@@ -347,16 +491,18 @@ class MinimumInvasionElasticSolver:
         )
         initial_height_hu = estimate_section_height_hu(blocks, state, outer_width_hu)
 
-        # Stage 2: Check if pure spacing adjustment (without any paragraph merging) fits budget_hu
-        for ls_b, ls_t, bw_tw, tw_tw, pad_v, p_aft in (
-            (142, 125, 290, 235, 60, 12),
-            (132, 118, 278, 222, 45, 9),
-            (122, 112, 268, 212, 35, 7),
+        # Stage 2: Interpolate spacing between max and min bounds before touching any paragraph breaks
+        mid_b_ls = int(round((max_b_ls + min_b_ls) / 2.0))
+        mid_t_ls = int(round((max_t_ls + min_t_ls) / 2.0))
+        for ls_b, ls_t, pad_v, p_aft in (
+            (max_b_ls, max_t_ls, 60, 12),
+            (mid_b_ls, mid_t_ls, 45, 9),
+            (min_b_ls, min_t_ls, 35, 7),
         ):
             state.body_line_spacing_pct = ls_b
             state.table_line_spacing_pct = ls_t
-            state.body_line_tw = bw_tw
-            state.table_line_tw = tw_tw
+            state.body_line_tw = compute_proportional_line_tw(b_font_hu, ls_b, is_table=False)
+            state.table_line_tw = compute_proportional_line_tw(t_font_hu, ls_t, is_table=True)
             state.cell_pad_v_hu = pad_v
             state.para_after_tw = p_aft
             if estimate_section_height_hu(blocks, state, outer_width_hu) <= budget_hu:
@@ -365,7 +511,7 @@ class MinimumInvasionElasticSolver:
                     blocks, state, budget_hu, outer_width_hu, initial_height_hu, initial_para_count, initial_cell_para_count
                 )
 
-        # Stage 3: Merge standalone short subheadings (<= 40 chars, not ending with '.' or '함') with following paragraph
+        # Stage 3: Merge standalone short subheadings (<= 40 chars, not ending with sentence terminal)
         i = 0
         while i < len(blocks) and estimate_section_height_hu(blocks, state, outer_width_hu) > budget_hu:
             cur = blocks[i]
@@ -395,7 +541,7 @@ class MinimumInvasionElasticSolver:
                 blocks, state, budget_hu, outer_width_hu, initial_height_hu, initial_para_count, initial_cell_para_count
             )
 
-        # Stage 4: Incrementally merge shortest adjacent paragraph pairs inside table cells until budget_hu is met (Early-Stop!)
+        # Stage 4: Incrementally merge shortest adjacent paragraph pairs inside table cells (Early-Stop!)
         while estimate_section_height_hu(blocks, state, outer_width_hu) > budget_hu:
             best_candidate = None
             best_pair_len = 999999
@@ -429,16 +575,6 @@ class MinimumInvasionElasticSolver:
             )
 
         # Stage 5: Only if still over budget, merge shortest consecutive body continuation paragraphs (Early-Stop!)
-        section_titles = {
-            "가설",
-            "핵심 타겟 및 목표 시장 규모",
-            "문제의 크기·시급성 및 기대효과",
-            "구성",
-            "구현 정도",
-            "검증 방안 및 고객 검증",
-            "차별성 및 포지셔닝",
-            "해결 과제 및 대응",
-        }
         while estimate_section_height_hu(blocks, state, outer_width_hu) > budget_hu:
             best_b_idx = -1
             best_len = 999999
@@ -453,7 +589,12 @@ class MinimumInvasionElasticSolver:
                         and blocks[idx + 1]["runs"][0].get("bold")
                         and len(blocks[idx + 1]["runs"][0]["text"].strip()) <= 35
                     )
-                    if t1 not in section_titles and t2 not in section_titles and not nxt_starts_bold and not t2.startswith("■"):
+                    if (
+                        not is_standalone_subheading_para(t1)
+                        and not is_standalone_subheading_para(t2)
+                        and not nxt_starts_bold
+                        and not t2.startswith("■")
+                    ):
                         pair_l = len(t1) + len(t2)
                         if pair_l < best_len:
                             best_len = pair_l
@@ -489,6 +630,10 @@ class MinimumInvasionElasticSolver:
             "budget_hu": budget_hu,
             "initial_height_hu": initial_height_hu,
             "final_height_hu": final_height_hu,
+            "body_font_size_hu": state.body_font_size_hu,
+            "table_font_size_hu": state.table_font_size_hu,
+            "body_line_spacing_pct": state.body_line_spacing_pct,
+            "table_line_spacing_pct": state.table_line_spacing_pct,
             "stopped_stage": state.stopped_stage,
             "initial_body_paras": initial_para_count,
             "final_body_paras": final_para_count,

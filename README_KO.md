@@ -1,12 +1,14 @@
 # T-DIR (`document-IR`) — 위상 보존 문서 중간 표현(Topological Document IR) 기반 MCP 서버
 
+**[last patch : 2026-11-08 17:52:00 UTC]**
+
 🌐 **[English (./README.md)](./README.md)** | 🇰🇷 **[한국어 (./README_KO.md)](./README_KO.md)**
 
 > [!WARNING]
 > **개발 진행 중 안내 (Work in Progress / Experimental Beta — `v3.0.0-beta`)**
 > 본 레포지토리는 현재 활발히 개발 및 아키텍처 검증이 진행 중인 **실험적 베타(Beta) 버전**으로, **아직 모든 기능이 완성된 상태가 아닙니다.**
 > - 단독 `.hwpx` 컨테이너 내부의 `<hp:pic>` 바이너리 이미지 스트림 직접 주입, `.xlsx` 스프레드시트 셀 스타일 리프팅, 수식 AST(`LaTeX` $\leftrightarrow$ `HWP EQN` $\leftrightarrow$ `OMML`) 양방향 컴파일러 등 일부 기능은 현재 구현 및 고도화 진행 중입니다.
-> - 베타 회귀 검증 과정에서 내부 IR 스키마(`SectionIR`, `SlotSpecIR`, `TargetDocumentSpecIR`, `ElasticLayoutState`) 및 MCP 툴 인터페이스가 예고 없이 변경될 수 있습니다.
+> - 베타 회귀 검증 과정에서 내부 IR 스키마(`SectionIR`, `SlotSpecIR`, `SourceDocumentSpecIR`, `TargetDocumentSpecIR`, `UserSpecOverrideIR`, `ElasticLayoutState`) 및 MCP 툴 인터페이스가 예고 없이 변경될 수 있습니다.
 
 ---
 
@@ -15,40 +17,52 @@
 **T-DIR (Topological Document Intermediate Representation)**은 한국 공공기관·기업 표준 문서 포맷(**한글 HWP v5.0 바이너리 `.hwp`**, **개방형 한글 `.hwpx`**)과 글로벌 문서 포맷(**MS Word `.docx`**, **Markdown `.md`**, **CSV/TSV `.csv`/`.tsv`**) 간의 구조적·기하학적 이질성을 해결하기 위해 설계된 문서 중간 표현(IR) 엔진이자 **MCP (Model Context Protocol) 서버**입니다.
 
 ### 기존 1:1 문서 변환 방식의 한계점
-1. **박스 모델(Box-Sizing) 및 물리 좌표계 불일치**: `HWPUNIT`($1\text{ pt} = 100\text{ HU}$), `Twips`($1\text{ pt} = 20\text{ dxa}$), 픽셀 단위를 단순 1:1 치환할 경우 중첩 표의 셀 여백, 셀 병합(`gridSpan` / `vMerge`), 장식용 빈 스페이서 열에서 오차가 누적되어 표가 깨지거나 문단 폭이 어긋납니다.
-2. **문서 그리드 스냅(`snapToGrid`)에 의한 줄간격 팽창**: `맑은 고딕`(`usWinAscent=1456, usWinDescent=398`) 등 상하 메트릭이 큰 한글 폰트를 MS Word/한글의 기본 줄 그리드 스냅(`w:lineRule="auto"`) 상태로 두면 12pt 본문 1줄이 약 $22.2\text{ pt}$($440\text{ twips}$)로 팽창하여 고정 양식 페이지 밖으로 넘치는 하단 잘림 현상이 발생합니다.
+1. **박스 모델(Box-Sizing) 및 물리 좌표계 불일치**: `HWPUNIT`($1\text{ pt} = 100\text{ HU}$), `Twips`($1\text{ pt} = 20\text{ dxa}$), `EMU`($1\text{ HU} = 127\text{ EMU}$), 픽셀 단위를 단순 1:1 치환할 경우 중첩 표의 셀 여백, 셀 병합(`gridSpan` / `vMerge`), 장식용 빈 스페이서 열에서 오차가 누적되어 표가 깨지거나 문단 폭이 어긋납니다.
+2. **문서 그리드 스냅(`snapToGrid`)에 의한 줄간격 팽창**: 상하 메트릭이 큰 한글 폰트를 MS Word/한글의 기본 줄 그리드 스냅(`w:lineRule="auto"`) 상태로 두면 본문 1줄 높이가 과도하게 팽창하여 고정 양식 페이지 밖으로 넘치는 하단 잘림 현상이 발생합니다.
 3. **고정 양식 템플릿(`2x2` 본문 표 및 `6x2` 첨부 표) 파손**: 정부지원사업 사업계획서 등 한국형 양식 문서는 각 문항(`Q1`, `Q2`, `Q3`, `Q4`)이 외곽 `2x2` 고정 표 내부에 들어가고 이미지가 최하단 `붙임` `6x2` 규격 표에 순서대로 배치되어야 합니다. 단순 복사·붙여넣기 시 외곽 표가 임의로 쪼개지거나 쪽마다 헤더가 반복 출력되는 문제가 발생합니다.
 4. **에이전트(LLM) 추론 시간 및 토큰 비용 과다**: 수만 줄에 달하는 OOXML(`word/document`)이나 OWPML(`Contents/section0`) XML 원문을 LLM 컨텍스트에 직접 올리면 $O(N^2)$ 어텐션 비용이 급증하고 텍스트 누락(환각) 위험이 커집니다.
 
 ---
 
-## 2. 핵심 아키텍처 (3-계층 위상 파이프라인)
+## 2. 핵심 아키텍처 및 무(無)하드코딩 동적 규격 결정 파이프라인
 
-T-DIR은 **텍스트 원문 불변성(Content Immutability)**, **2차원 표 위상 정규화(2D Grid Topology)**, **물리 엔진 투영(Metric Projection)**을 3개의 독립 계층으로 분리합니다.
+T-DIR은 특정 폰트명, 픽셀/HWPUNIT 상수, 특정 문서 고유 문자열을 코드에 하드코딩하지 않고, **원본·타겟 문서의 물리적 규격 동적 추출**과 **사용자 MCP 명시 규격(`UserSpecOverrideIR`) 우선순위 결합**으로 작동합니다.
 
 ```mermaid
 flowchart LR
-    A["원본 문서 입력<br/>(.docx, .hwp, .hwpx, .md, .csv)"] --> B["Layer 1: Frontend Lifters<br/>(포맷·섹션·템플릿 슬롯 동적 탐색)"]
-    B --> C["Layer 2: T-DIR 코어 &<br/>5단계 최소 침습 탄성 솔버 (Early-Stop)"]
-    C --> D["Layer 3: Backend Projectors<br/>(.hwp CFB, .hwpx, .docx, .md)"]
-    D --> E["무손실 검증기<br/>(비공백 SHA-256 해시 + PDF 쪽수 검수)"]
+    A["원본 및 타겟 템플릿 입력<br/>(.docx, .hwp, .hwpx, .md, .csv)"] --> B["Layer 1: 동적 규격·슬롯 스캐너<br/>(DocInfo / Section0 / OOXML Styles)"]
+    U["사용자 명시 규격 오버라이드<br/>(UserSpecOverrideIR)"] --> C["3단계 우선순위 규격 결정기<br/>(User > Target > Source)"]
+    B --> C
+    C --> D["Layer 2: 2D 위상 정규화 및<br/>5단계 최소 침습 탄성 솔버 (Early-Stop)"]
+    D --> E["Layer 3: 결정론적 프로젝터<br/>(.hwp CFB, .hwpx, .docx, .md)"]
+    E --> F["무손실 검증기<br/>(비공백 SHA-256 해시 + PDF 쪽수 검수)"]
 ```
 
-### Layer 1: 동적 리프터(Lifters) 및 템플릿 슬롯 자동 스캐너
-- **하드코딩 없는 동적 슬롯 탐색**: HWP v5.0 템플릿의 압축된 `Section0` 바이너리 레코드 트리(`Tag 71`, `Tag 77`, `Tag 72`)를 런타임에 스캔하여 `2x2` 문항 본문 슬롯(`Q1`..`Q4`)과 최하단 `6x2` 사진 첨부 슬롯(`ATTACH 1..6`)의 레코드 위치와 가용 폭을 자동 역산합니다.
-- **2차원 표 위상 정규화**: 가로·세로 병합을 2D 행렬로 복원한 뒤 텍스트가 없는 장식용 빈 스페이서 행/열을 제거하고, 화살표 기호(`▶`, `→`) 열 폭 클램핑 및 계단식 막대 차트 표의 시간순(`C0..C3`) 정규화를 수행합니다.
+### 2.1. 3단계 규격 우선순위 결정 체계
+모든 타이포그래피(폰트 패밀리, 본문/표 글자 크기, 줄간격 범위)와 기하 규격(용지 크기, 여백, 슬롯 폭/높이, 쪽수 예산)은 [`./ir_schema.py`](./ir_schema.py)의 우선순위 체인에 의해 결정론적으로 결합됩니다:
 
-### Layer 2: 5단계 최소 침습 탄성 레이아웃 솔버 (`MinimumInvasionElasticSolver` Early-Stop)
-원본 텍스트를 단 1글자도 삭제·요약하지 않으면서 목표 쪽수 예산(예: `Q1` 2쪽 + `Q2` 2쪽 = 총 4쪽) 안에 맞추기 위해, 문단 꾸겨넣기(과잉 병합)를 최소화하는 **5단계 점진적 조기 종료(Early-Stop)** 알고리즘을 적용합니다:
-- **Stage 1 (빈 스페이서 제거)**: 빈 스페이서 문단과 표 내부 빈 스페이서 행/열만 제거하고 그리드 스냅(`snapToGrid`)을 해제합니다.
-- **Stage 2 (줄간격 및 셀 패딩 탄성 압축)**: 원본 문단 줄바꿈을 **100% 그대로 보존**한 상태에서 본문 줄간격(`160% -> 122%`), 표 줄간격(`130% -> 112%`), 셀 상하 패딩(`100 HU -> 35 HU`)만 점진적으로 압축합니다.
-- **Stage 3 (단독 짧은 소제목 인라인화 조기 종료)**: 단독 1줄짜리 짧은 소제목($\le 40$자, 마침표 미포함)만 뒤따르는 본문 문단 앞머리에 굵은 글씨(`Bold`) 인라인 리드로 결합합니다(이때 비공백 문자 해시가 변하지 않도록 공백 2칸 `"  "`만 구분자로 사용). 목표 높이 이하로 들어오면 **즉시 종료(Early-Stop)**하여 표 내부 셀 줄바꿈과 본문 문단을 100% 보존합니다.
-- **Stage 4 (표 내부 셀 최단 문단 쌍 부분 병합 조기 종료)**: 여전히 예산을 초과할 경우에만, 다중 문단을 가진 표 셀 중 합산 길이가 가장 짧은 인접 문단 쌍부터 **1쌍씩만 순차 병합**하며 매 스텝 예산 달성 시 즉시 멈춥니다.
-- **Stage 5 (본문 연속 문단 최소 병합 조기 종료)**: Stage 4 이후에도 미세하게 예산을 초과하는 경우에만 가장 짧은 본문 연속 문단 쌍을 1쌍씩 병합하고 예산 충족 즉시 멈춥니다.
+$$\text{EffectiveSpec} = \text{Priority 1 }(\text{UserSpecOverrideIR}) \succ \text{Priority 2 }(\text{TargetDocumentSpecIR}) \succ \text{Priority 3 }(\text{SourceDocumentSpecIR})$$
 
-### Layer 3: 결정론적 바이너리·XML 프로젝터 및 무손실 검증기
-- **HWP v5.0 네이티브 바이너리 프로젝터 ([`./codec_hwp_v5.py`](./codec_hwp_v5.py) + [`./cfb_ole2.py`](./cfb_ole2.py))**: 외부 한글 프로그램 없이 순수 파이썬으로 HWP v5.0 바이너리 레코드와 MS-CFB(`CFBArchive` OLE2 512B 섹터 / 64B 미니스트림 / Red-Black 디렉토리 트리) 컨테이너를 재조립합니다.
-- **100.00% 비공백 텍스트 불변성 검증 ([`./ir_schema.py`](./ir_schema.py))**: 변환 전·후 모든 섹션의 비공백 문자 시퀀스(`SHA-256`)를 대조하여 단 1글자의 유실이나 변조(`0`자 손실)도 없음을 수학적으로 보증합니다.
+1. **Priority 1 — 사용자 명시 규격 (`UserSpecOverrideIR`)**: 사용자 또는 에이전트가 MCP 호출 시 명시한 본문/표 폰트 패밀리, 글자 크기(pt), 줄간격 상·하한 퍼센트, 용지 규격 및 여백(mm), 섹션별 쪽수 예산, 외곽 표 보존 여부, 첨부 캡션 목록이 최우선 적용됩니다.
+2. **Priority 2 — 타겟 템플릿 동적 추출 규격 (`TargetDocumentSpecIR` / [`./codec_hwp_v5.py`](./codec_hwp_v5.py))**: 타겟 HWP 템플릿 바이너리 스트림을 런타임에 파싱하여 추출합니다:
+   - `DocInfo` 스트림: `Tag 19`(UTF-16LE 폰트명 목록), `Tag 21`(글자 크기 `HU` 및 RGB 색상), `Tag 25`(문단 줄간격 퍼센트).
+   - `Section0` 스트림: `Tag 73`(용지 폭·높이·여백 `HU`), 표지/프리앰블 블록, `2x2` 문항 외곽 표(외곽 폭, 열 폭, 좌·우 헤더 텍스트, 본문 셀 유효 폭 `HU`), 최하단 `6x2` 첨부 슬롯(`ATTACH 1..6`).
+3. **Priority 3 — 원본 문서 동적 추출 규격 (`SourceDocumentSpecIR` / [`./codec_ooxml_owpml.py`](./codec_ooxml_owpml.py))**: 원본 문서(`.docx`의 `word/styles` 및 `word/document` `sectPr` 등)에서 추출한 본문/표 대표 폰트 및 글자 크기로, 타겟 템플릿의 본문 셀이 비어 있을 때 자동 승계됩니다.
+
+### 2.2. 순수 2차원 위상 기반 표·문단 분류기 ([`./elastic_solver.py`](./elastic_solver.py))
+특정 문서의 텍스트 문자열을 비교하는 하드코딩 분기를 전면 배제하고 순수 2D 행렬 위상과 문장부호 구조만으로 정규화합니다:
+- **계단식 희소 차트 표 탐지기**: 전체 열 병합 기준축 행을 중심으로 상·하단 행들이 행당 `1~2`개의 비공백 셀만 갖는 희소 계단 위상일 때 이를 4행 시계열 비교 표로 자동 압축합니다.
+- **수직 단계-화살표 표 탐지기**: 단일 열(홀수 행 $\ge 3$) 표에서 홀수 인덱스 행(`r = 1, 3, ...`)이 모두 짧은 화살표/연결 기호($\le 25$자)일 때 이를 직전 단계 행의 인라인 접미사로 폴딩합니다.
+- **다중 열 스페이서 카드 표 압축기**: 다중 열 표에서 모든 비공백 행의 실제 데이터가 있는 셀이 1개뿐인 경우 불필요한 좌우 스페이서 열을 소거하고 전체 폭 `1`열 카드 스택으로 정규화합니다.
+- **단독 짧은 소제목 판별기**: 글자 수($\le 40$자), 굵은 글씨/기호 접두사 여부, 마침표 미포함 조건만으로 단독 소제목을 판별하여 Stage 3 인라인 결합에 사용합니다.
+
+### 2.3. 5단계 최소 침습 탄성 레이아웃 솔버 (`MinimumInvasionElasticSolver` Early-Stop)
+해석된 본문·표 폰트 크기에 비례하여 줄 높이와 줄당 글자 수용량을 동적으로 계산하며, 목표 쪽수 예산 이하로 들어오는 순간 **즉시 멈추는(Early-Stop)** 5단계 루프를 수행합니다:
+- **Stage 1 (스페이서 소거)**: 빈 스페이서 문단과 표 내부 빈 스페이서 행/열만 제거하고 그리드 스냅(`snapToGrid = False`)을 해제합니다.
+- **Stage 2 (줄간격·여백 보간)**: 원본 문단 및 표 셀 줄바꿈을 **100% 그대로 보존**한 상태에서 줄간격과 셀 패딩만 허용 범위 내에서 점진적으로 압축합니다.
+- **Stage 3 (단독 소제목 인라인 리드 결합)**: 단독 짧은 소제목($\le 40$자)만 뒤따르는 본문 문단 앞머리에 굵은 글씨 인라인 리드로 결합합니다(비공백 해시 불변을 위해 공백 2칸 `"  "`만 삽입).
+- **Stage 4 (표 셀 내부 부분 병합 조기 종료)**: 다중 문단을 가진 표 셀 중 합산 길이가 가장 짧은 인접 문단 쌍부터 **1쌍씩만 순차 병합**하며 매 병합 직후 예산을 재검사합니다.
+- **Stage 5 (본문 연속 문단 최소 병합 조기 종료)**: Stage 4 이후에도 예산을 초과할 때만 가장 짧은 본문 연속 문단 쌍을 1쌍씩 병합합니다.
 
 ---
 
@@ -56,42 +70,81 @@ flowchart LR
 
 | 모듈 경로 | 역할 및 설명 |
 | :--- | :--- |
-| [`./__init__.py`](./__init__.py) | 패키지 초기화 및 주요 클래스(`TdirBetaMcpServer`, `MinimumInvasionElasticSolver`) 익스포트 |
-| [`./ir_schema.py`](./ir_schema.py) | T-DIR v3.0 핵심 데이터클래스(`TextRunIR`, `ParagraphIR`, `TableCellIR`, `TableGridIR`, `MediaObjectIR`, `SectionIR`, `SlotSpecIR`, `TargetDocumentSpecIR`, `ConversionJobIR`) 및 비공백 `SHA-256` 무손실 검증기 |
+| [`./__init__.py`](./__init__.py) | 패키지 초기화 및 주요 클래스(`TdirBetaMcpServer`, `MinimumInvasionElasticSolver`, `SourceDocumentSpecIR`, `TargetDocumentSpecIR`, `UserSpecOverrideIR`) 익스포트 |
+| [`./ir_schema.py`](./ir_schema.py) | T-DIR v3.0 데이터클래스(`TextRunIR`, `ParagraphIR`, `TableCellIR`, `TableGridIR`, `MediaObjectIR`, `SectionIR`, `SlotSpecIR`, `SourceDocumentSpecIR`, `TargetDocumentSpecIR`, `UserSpecOverrideIR`, `ConversionJobIR`), 3단계 규격 우선순위 결정기, 단위 변환 함수 및 비공백 `SHA-256` 검증기 |
 | [`./cfb_ole2.py`](./cfb_ole2.py) | 순수 파이썬 MS-CFB (`CFBArchive` OLE2 Compound File Binary v3) 파서 및 빌더 (512B 섹터, 64B 미니스트림, Red-Black 트리 직렬화) |
-| [`./elastic_solver.py`](./elastic_solver.py) | 2D 표 위상 정규화기 및 5단계 최소 침습 조기 종료 솔버(`MinimumInvasionElasticSolver`, `ElasticLayoutState`) |
-| [`./codec_hwp_v5.py`](./codec_hwp_v5.py) | HWP v5.0 바이너리 레코드 파서, 동적 템플릿 슬롯 스캐너, 리프터 및 프로젝터 |
-| [`./codec_ooxml_owpml.py`](./codec_ooxml_owpml.py) | OOXML(`.docx`) 및 OWPML(`.hwpx`) 동적 섹션 리프터 및 프로젝터 |
+| [`./elastic_solver.py`](./elastic_solver.py) | 순수 위상 기반 2D 표 정규화기 및 5단계 최소 침습 조기 종료 솔버(`MinimumInvasionElasticSolver`, `ElasticLayoutState`) |
+| [`./codec_hwp_v5.py`](./codec_hwp_v5.py) | HWP v5.0 바이너리 레코드 파서, `DocInfo` 동적 타이포그래피 추출기, 동적 폰트 등록기, `Section0` 템플릿 슬롯 스캐너, 리프터 및 바이너리 프로젝터 |
+| [`./codec_ooxml_owpml.py`](./codec_ooxml_owpml.py) | OOXML(`.docx`) 스타일·용지 스캐너, 동적 섹션 리프터 및 `TargetDocumentSpecIR` 기반 `.docx` / `.hwpx` 프로젝터 |
 | [`./codec_tabular_markup.py`](./codec_tabular_markup.py) | Markdown(`.md`) 및 정형 표(`.csv`, `.tsv`) 리프터·프로젝터 |
-| [`./mcp_server.py`](./mcp_server.py) | JSON-RPC 2.0 (`stdio`) 기반 독립 MCP 서버 (`TdirBetaMcpServer` / `tdir-document-beta`, 5대 툴 제공) |
-| [`./test_regression_suite.py`](./test_regression_suite.py) | PoC 1·2·3 통합 회귀 검증 스위트 (동적 탐색 $\to$ Early-Stop 솔빙 $\to$ 다중 포맷 사출 $\to$ `SHA-256` 및 PDF 8쪽 검수) |
+| [`./mcp_server.py`](./mcp_server.py) | JSON-RPC 2.0 (`stdio`) 기반 독립 MCP 서버 (`TdirBetaMcpServer` / `tdir-document-beta`, 5대 툴 및 `UserSpecOverrideIR` JSON 스키마 제공) |
+| [`./test_regression_suite.py`](./test_regression_suite.py) | 통합 회귀 검증 스위트 (동적 타이포그래피·슬롯 탐색 $\to$ `UserSpecOverrideIR` 우선순위 검증 $\to$ Early-Stop 솔빙 $\to$ 다중 포맷 사출 $\to$ `SHA-256` 및 PDF 8쪽 검수) |
 
 ---
 
-## 4. 제공되는 5대 MCP 툴 명세
+## 4. 제공되는 5대 MCP 툴 및 `UserSpecOverrideIR` 스키마 명세
 
 ```python
-# 1. 원본 문서 및 타겟 템플릿 슬롯 동적 프로빙
+# 1. 원본 문서 및 타겟 템플릿의 타이포그래피·용지 규격·슬롯 동적 프로빙
 tdir_probe_files(source_paths: list[str], target_path: str) -> dict
 
-# 2. 섹션·미디어 슬롯 매핑 플랜 수립 및 탄성 솔버 Early-Stop 단계 프리뷰
-tdir_build_mapping_plan(job_id: str, user_constraints: dict | None = None) -> dict
+# 2. 3단계 우선순위 규격 결정(UserSpecOverrideIR > TargetDocumentSpecIR > SourceDocumentSpecIR) 및 탄성 솔버 프리뷰
+tdir_build_mapping_plan(
+    job_id: str,
+    user_spec_overrides: dict | None = None,
+    user_constraints: dict | None = None,
+) -> dict
 
 # 3. 다중 포맷(["hwp", "hwpx", "docx", "md"]) 위상 보존 변환 실행
-tdir_execute_conversion(job_id: str, output_prefix: str, output_formats: list[str], base_hwpx_path: str | None = None) -> dict
+tdir_execute_conversion(
+    job_id: str,
+    output_prefix: str,
+    output_formats: list[str] | None = None,
+    page_body_height_hu: int | None = None,
+    base_hwpx_path: str | None = None,
+    user_spec_overrides: dict | None = None,
+) -> dict
 
 # 4. 비공백 SHA-256 100.00% 텍스트 무손실 검증 및 헤드리스 PDF 쪽수 검수
 tdir_verify_fidelity_and_layout(job_id: str, export_pdf: bool = True) -> dict
 
 # 5. 특정 문단 병합 잠금 및 표 열 폭 핀포인트 미세 조정
-tdir_adjust_block_layout(job_id: str, section_uid: str, block_index: int, lock_unmerged: bool | None = None, col_widths_hu: list[int] | None = None) -> dict
+tdir_adjust_block_layout(
+    job_id: str,
+    section_uid: str,
+    block_index: int,
+    lock_unmerged: bool | None = None,
+    col_widths_hu: list[int] | None = None,
+) -> dict
 ```
 
-1. **Tool 1 — 원본 및 템플릿 동적 프로빙**: 원본 문서의 포맷과 섹션 구조(글자 수, 표 개수, 문단 수, 미디어 개수, `SHA-256`) 및 타겟 템플릿의 슬롯(`2x2` 본문 슬롯, `6x2` 첨부 슬롯)을 런타임에 동적 탐색하여 요약 메타데이터만 반환합니다.
-2. **Tool 2 — 매핑 플랜 수립 및 탄성 솔버 프리뷰**: 원본 섹션·이미지를 타겟 템플릿 슬롯에 매핑하고, `MinimumInvasionElasticSolver` 시뮬레이션을 통해 각 섹션이 몇 단계(`Stage 1`~`Stage 5`)에서 조기 종료되는지와 보존되는 문단 수를 프리뷰합니다.
-3. **Tool 3 — 다중 포맷 변환 실행**: 지정된 출력 포맷(`["hwp", "hwpx", "docx", "md"]`)으로 위상 보존 변환 파일을 일괄 생성합니다.
-4. **Tool 4 — 무손실 텍스트 및 레이아웃 쪽수 검증**: 생성된 파일들을 역파싱하여 원본 대비 비공백 텍스트 100.00% 포함 여부(`0`자 손실)를 검증하고, 선택적으로 헤드리스 PDF 렌더링을 수행해 목표 쪽수(예: 8쪽) 준수 여부를 확인합니다.
-5. **Tool 5 — 블록 단위 핀포인트 레이아웃 미세 조정**: 특정 문단의 병합 잠금이나 특정 표의 열 폭을 핀포인트로 미세 조정합니다.
+### `UserSpecOverrideIR` 지원 파라미터 예시
+사용자나 에이전트는 Tool 2 또는 Tool 3 호출 시 아래 필드를 통해 변환 대상 규격을 명시적으로 지정할 수 있습니다(생략된 필드는 타겟 템플릿 및 원본 문서에서 자동 추출·승계됩니다):
+
+```json
+{
+  "body_font_family": "함초롬바탕",
+  "table_font_family": "함초롬돋움",
+  "body_font_size_pt": 11.5,
+  "table_font_size_pt": 9.5,
+  "body_line_spacing_min_pct": 122,
+  "body_line_spacing_max_pct": 160,
+  "table_line_spacing_min_pct": 112,
+  "table_line_spacing_max_pct": 125,
+  "page_width_mm": 210.0,
+  "page_height_mm": 297.0,
+  "margins_mm": {"top": 15.0, "bottom": 15.0, "left": 20.0, "right": 20.0},
+  "section_page_budgets": {"Q1": 2.0, "Q2": 2.0},
+  "exclude_sections": ["PREAMBLE", "Q3", "Q4", "REFERENCES"],
+  "preserve_outer_tables": true,
+  "route_media_to_attachment_slots": true,
+  "max_attachment_images": 3,
+  "attachment_captions": [
+    "[붙임 1] 시스템 아키텍처 다이어그램",
+    "[붙임 2] 3단계 워크플로우 및 타겟 시장 로드맵"
+  ]
+}
+```
 
 ---
 

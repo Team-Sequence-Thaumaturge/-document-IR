@@ -1,5 +1,6 @@
 """
-T-DIR v3.0 Beta MCP Server Full Regression Test Suite (PoC 1, PoC 2, PoC 3 + Elastic Solver Verification).
+T-DIR v3.0 Beta MCP Server Full Regression Test Suite
+(Dynamic Spec Extraction + UserSpecOverrideIR Priority Chain + PoC 1/2/3 + Elastic Solver Verification).
 Tests all 5 MCP tools end-to-end without touching existing MCP servers or overwriting production files.
 """
 
@@ -22,7 +23,6 @@ REGRESSION_OUT_DIR = r"c:\Users\stella\Desktop\stella test\tdir_mcp_beta\regress
 def count_pdf_pages(pdf_path: str) -> int:
     with open(pdf_path, "rb") as f:
         raw = f.read()
-    # Count /Type /Page (excluding /Type /Pages)
     pages = re.findall(rb"/Type\s*/Page\b(?!s)", raw)
     return len(pages)
 
@@ -50,35 +50,52 @@ def run_poc2_and_poc3_regression(srv: TdirBetaMcpServer) -> dict:
     list_resp = handle_jsonrpc_request(srv, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
     assert len(list_resp["result"]["tools"]) == 5
 
-    # Step 2: Tool #1 - tdir_probe_files (Dynamic format, section, and template slot discovery)
+    # Step 2: Tool #1 - tdir_probe_files (Dynamic format, typography, section, and template slot discovery)
     probe_res = srv.tdir_probe_files([SOURCE_DOCX_PATH], TEMPLATE_HWP_PATH)
     job_id = probe_res["job_id"]
+    t_spec_info = probe_res["target_spec"]
+    s_spec_info = probe_res["sources"][0]["source_spec"]
     print(f"[Step 1: tdir_probe_files] job_id={job_id}")
+    print(
+        f"   Discovered Source Spec: font='{s_spec_info['body_font_family']}', "
+        f"body_hu={s_spec_info['body_font_size_hu']}, table_hu={s_spec_info['table_font_size_hu']}, "
+        f"page={s_spec_info['page_width_hu']}x{s_spec_info['page_height_hu']} HU"
+    )
+    print(
+        f"   Discovered Target Template Spec: font='{t_spec_info['body_font_family']}', "
+        f"body_pt={t_spec_info['body_font_size_pt']}pt ({t_spec_info['body_font_size_hu']} HU), "
+        f"table_pt={t_spec_info['table_font_size_pt']}pt ({t_spec_info['table_font_size_hu']} HU), "
+        f"line_spacing={t_spec_info['default_line_spacing_pct']}%, "
+        f"page={t_spec_info['page_width_hu']}x{t_spec_info['page_height_hu']} HU, "
+        f"preamble_blocks={t_spec_info['preamble_blocks_count']}"
+    )
     for s_info in probe_res["sources"][0]["sections_discovered"]:
         print(
             f"   Discovered Source Section [{s_info['section_uid']}]: "
             f"chars={s_info['non_ws_chars']:,}, tables={s_info['tables_count']}, "
             f"paras={s_info['paras_count']}, media={s_info['media_count']}, sha256={s_info['text_sha256'][:16]}"
         )
-    for sl_info in probe_res["target_spec"]["section_slots"]:
+    for sl_info in t_spec_info["section_slots"]:
         print(
             f"   Discovered Template Section Slot [{sl_info['slot_uid']}]: "
-            f"title='{sl_info['title']}', outer_tbl_rec={sl_info['outer_tbl_record_idx']}, "
-            f"body_cell_rec={sl_info['body_cell_record_idx']}, width_hu={sl_info['available_width_hu']}"
-        )
-    for att_info in probe_res["target_spec"]["attachment_slots"][:2]:
-        print(
-            f"   Discovered Template Attachment Slot [{att_info['slot_uid']}]: "
-            f"img_cell_rec={att_info['body_cell_record_idx']}, cap_cell_rec={att_info['caption_cell_record_idx']}"
+            f"title='{sl_info['title']}', subtitle='{sl_info['subtitle'][:24]}', "
+            f"outer_w={sl_info['outer_width_hu']}, cols={sl_info['col_widths_hu']}, "
+            f"avail_w={sl_info['available_width_hu']}"
         )
 
-    # Step 3: Tool #2 - tdir_build_mapping_plan (Dynamic mapping & MinimumInvasionElasticSolver simulation)
+    # Step 3: Tool #2 - tdir_build_mapping_plan with explicit `user_spec_overrides` (`UserSpecOverrideIR`)
     plan_res = srv.tdir_build_mapping_plan(
         job_id=job_id,
-        user_constraints={
+        user_spec_overrides={
             "exclude_sections": ["PREAMBLE", "Q3", "Q4", "REFERENCES"],
-            "page_budgets": {"Q1": 2.0, "Q2": 2.0},
-            "page_body_height_hu": 78500,
+            "section_page_budgets": {"Q1": 2.0, "Q2": 2.0},
+            "preserve_outer_tables": True,
+            "route_media_to_attachment_slots": True,
+            "max_attachment_images": 3,
+            "attachment_captions": [
+                "[붙임 1] 광운대 프리즘 (PRISM) — AI 비교과 프로그램 추천 시스템 아키텍처 및 데이터 파이프라인",
+                "[붙임 2] AI 매칭 프로세스 3단계 워크플로우 및 핵심 타겟 시장(TAM·SAM·SOM) 로드맵",
+            ],
         },
     )
     print(f"[Step 2: tdir_build_mapping_plan] slot_mapping={plan_res['slot_mapping']}")
@@ -120,9 +137,32 @@ def run_poc2_and_poc3_regression(srv: TdirBetaMcpServer) -> dict:
     adj_res = srv.tdir_adjust_block_layout(job_id=job_id, section_uid="Q1", block_index=1, lock_unmerged=True)
     print(f"[Step 6: tdir_adjust_block_layout] {adj_res}")
 
-    # Step 7: PoC 1 Markdown round-trip check
+    # Step 7: Test UserSpecOverrideIR custom font & font size override in HWP/DOCX
+    override_plan = srv.tdir_build_mapping_plan(
+        job_id=job_id,
+        user_spec_overrides={
+            "body_font_family": "함초롬바탕",
+            "table_font_family": "함초롬돋움",
+            "body_font_size_pt": 11.5,
+            "table_font_size_pt": 9.5,
+            "exclude_sections": ["PREAMBLE", "Q3", "Q4", "REFERENCES"],
+            "section_page_budgets": {"Q1": 2.0, "Q2": 2.0},
+        },
+    )
+    eff_ov = override_plan["effective_spec"]
+    assert eff_ov["body_font_family"] == "함초롬바탕"
+    assert eff_ov["table_font_family"] == "함초롬돋움"
+    assert eff_ov["body_font_size_hu"] == 1150
+    assert eff_ov["table_font_size_hu"] == 950
+    print(
+        f"[Step 7: UserSpecOverrideIR Priority Verification] "
+        f"body_font='{eff_ov['body_font_family']}' ({eff_ov['body_font_size_pt']}pt / {eff_ov['body_font_size_hu']} HU), "
+        f"table_font='{eff_ov['table_font_family']}' ({eff_ov['table_font_size_pt']}pt / {eff_ov['table_font_size_hu']} HU)"
+    )
+
+    # Step 8: PoC 1 Markdown round-trip check
     poc1_res = run_poc1_markdown_and_standalone_regression(srv, job_id)
-    print(f"[Step 7: PoC 1 Markdown Round-Trip Check] {poc1_res}")
+    print(f"[Step 8: PoC 1 Markdown Round-Trip Check] {poc1_res}")
 
     return {
         "init_ok": init_resp["result"]["serverInfo"]["name"] == "tdir-document-beta",
@@ -134,7 +174,7 @@ def run_poc2_and_poc3_regression(srv: TdirBetaMcpServer) -> dict:
     }
 
 
-def main():
+def main() -> None:
     srv = TdirBetaMcpServer()
     summary = run_poc2_and_poc3_regression(srv)
     assert summary["pdf_pages"] == 8, f"Expected 8 pages in PDF, got {summary['pdf_pages']}"

@@ -1,5 +1,9 @@
 """
 T-DIR v3.0 Beta Isolated MCP Server (JSON-RPC 2.0 over stdio + Direct Python API).
+Zero hardcoded font names, pixel/HWPUNIT constants, or domain strings:
+  - Dynamically extracts source & target specifications at runtime (`tdir_probe_files`).
+  - Exposes first-class `user_spec_overrides` (`UserSpecOverrideIR`) in MCP tool schemas
+    with strict priority resolution: UserSpecOverrideIR > TargetDocumentSpecIR > SourceDocumentSpecIR.
 Exposes 5 tools:
   1. tdir_probe_files
   2. tdir_build_mapping_plan
@@ -12,7 +16,6 @@ import os
 import sys
 import uuid
 import json
-import copy
 import zipfile
 import subprocess
 import xml.etree.ElementTree as ET
@@ -20,15 +23,94 @@ from typing import List, Dict, Optional, Tuple
 
 from .ir_schema import (
     SectionIR,
+    SourceDocumentSpecIR,
     TargetDocumentSpecIR,
+    UserSpecOverrideIR,
     ConversionJobIR,
+    resolve_effective_document_spec,
     validate_text_immutability,
     extract_ir_non_ws_text,
+    hu_to_pt,
 )
-from .elastic_solver import ElasticLayoutState, MinimumInvasionElasticSolver
-from .codec_hwp_v5 import scan_hwp_template_slots, lift_hwp_to_ir, project_ir_to_hwp
-from .codec_ooxml_owpml import lift_docx_to_ir, project_ir_to_docx, project_ir_to_hwpx
+from .elastic_solver import (
+    ElasticLayoutState,
+    MinimumInvasionElasticSolver,
+    compute_effective_page_body_height_hu,
+)
+from .codec_hwp_v5 import (
+    scan_hwp_template_slots,
+    scan_hwp_source_spec,
+    lift_hwp_to_ir,
+    project_ir_to_hwp,
+)
+from .codec_ooxml_owpml import (
+    scan_docx_style_and_page_spec,
+    lift_docx_to_ir,
+    project_ir_to_docx,
+    project_ir_to_hwpx,
+)
 from .codec_tabular_markup import lift_markdown_to_ir, project_ir_to_markdown, lift_csv_to_ir
+
+
+USER_SPEC_OVERRIDES_JSON_SCHEMA = {
+    "type": "object",
+    "description": (
+        "Explicit user or target specification overrides (Priority 1 > Target Template > Source File). "
+        "Any omitted field automatically inherits from the target template or source document."
+    ),
+    "properties": {
+        "body_font_family": {"type": "string", "description": "Body prose font family name."},
+        "table_font_family": {"type": "string", "description": "Inner table font family name."},
+        "body_font_size_pt": {"type": "number", "description": "Body prose font size in points (e.g. 12.0)."},
+        "table_font_size_pt": {"type": "number", "description": "Inner table font size in points (e.g. 10.0)."},
+        "body_line_spacing_min_pct": {"type": "integer", "description": "Minimum body line spacing percentage."},
+        "body_line_spacing_max_pct": {"type": "integer", "description": "Initial/maximum body line spacing percentage."},
+        "table_line_spacing_min_pct": {"type": "integer", "description": "Minimum table line spacing percentage."},
+        "table_line_spacing_max_pct": {"type": "integer", "description": "Initial/maximum table line spacing percentage."},
+        "page_width_mm": {"type": "number", "description": "Target page width in millimeters (e.g. 210.0 for A4)."},
+        "page_height_mm": {"type": "number", "description": "Target page height in millimeters (e.g. 297.0 for A4)."},
+        "margins_mm": {
+            "type": "object",
+            "description": "Page margins in millimeters ({top, bottom, left, right}).",
+        },
+        "total_page_limit": {"type": "integer", "description": "Total document page ceiling."},
+        "section_page_budgets": {
+            "type": "object",
+            "description": "Per-section page budget map (e.g. {'Q1': 2.0, 'Q2': 2.0}).",
+        },
+        "page_body_height_hu": {
+            "type": "integer",
+            "description": "Optional override for effective single-page body height in HWPUNIT.",
+        },
+        "include_sections": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Explicit whitelist of source section UIDs to transplant.",
+        },
+        "exclude_sections": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "List of source section UIDs to exclude.",
+        },
+        "preserve_outer_tables": {
+            "type": "boolean",
+            "description": "Preserve target template 2x2 outer section container tables (treatAsChar=False).",
+        },
+        "route_media_to_attachment_slots": {
+            "type": "boolean",
+            "description": "Route embedded section images sequentially into bottom attachment slots.",
+        },
+        "max_attachment_images": {
+            "type": "integer",
+            "description": "Maximum number of images to route to attachment slots.",
+        },
+        "attachment_captions": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Optional explicit caption strings for routed attachment images.",
+        },
+    },
+}
 
 
 class TdirBetaMcpServer:
@@ -56,18 +138,88 @@ class TdirBetaMcpServer:
             return "TSV"
         return "PLAIN_TEXT"
 
+    def _serialize_target_spec(self, spec: TargetDocumentSpecIR) -> dict:
+        return {
+            "template_path": spec.template_path,
+            "target_format": spec.target_format,
+            "body_font_family": spec.body_font_family,
+            "table_font_family": spec.table_font_family,
+            "body_font_size_hu": spec.body_font_size_hu,
+            "body_font_size_pt": hu_to_pt(spec.body_font_size_hu),
+            "table_font_size_hu": spec.table_font_size_hu,
+            "table_font_size_pt": hu_to_pt(spec.table_font_size_hu),
+            "default_line_spacing_pct": spec.default_line_spacing_pct,
+            "min_line_spacing_pct": spec.min_line_spacing_pct,
+            "page_width_hu": spec.page_width_hu,
+            "page_height_hu": spec.page_height_hu,
+            "margins_hu": {
+                "top": spec.margin_top_hu,
+                "bottom": spec.margin_bottom_hu,
+                "left": spec.margin_left_hu,
+                "right": spec.margin_right_hu,
+                "header": spec.margin_header_hu,
+                "footer": spec.margin_footer_hu,
+            },
+            "preamble_blocks_count": len(spec.preamble_blocks),
+            "attachment_header_paras_count": len(spec.attachment_header_paras),
+            "section_slots": [
+                {
+                    "slot_uid": sl.slot_uid,
+                    "title": sl.discovered_title_text,
+                    "subtitle": sl.discovered_subtitle_text,
+                    "outer_tbl_record_idx": sl.outer_tbl_record_idx,
+                    "body_cell_record_idx": sl.body_cell_record_idx,
+                    "outer_width_hu": sl.outer_width_hu,
+                    "col_widths_hu": sl.col_widths_hu,
+                    "available_width_hu": sl.available_width_hu,
+                    "available_height_hu": sl.available_height_hu,
+                    "max_pages": sl.max_pages,
+                }
+                for sl in spec.section_slots
+            ],
+            "attachment_slots": [
+                {
+                    "slot_uid": sl.slot_uid,
+                    "caption": sl.discovered_title_text,
+                    "body_cell_record_idx": sl.body_cell_record_idx,
+                    "caption_cell_record_idx": sl.caption_cell_record_idx,
+                    "available_width_hu": sl.available_width_hu,
+                    "available_height_hu": sl.available_height_hu,
+                }
+                for sl in spec.attachment_slots
+            ],
+        }
+
     def tdir_probe_files(self, source_paths: List[str], target_path: str) -> dict:
         job_id = f"job_{uuid.uuid4().hex[:8]}"
-        target_spec = scan_hwp_template_slots(target_path)
-        avail_w = target_spec.section_slots[0].available_width_hu if target_spec.section_slots else 46200
+        raw_target_spec = scan_hwp_template_slots(target_path)
+
+        source_specs: List[SourceDocumentSpecIR] = []
+        for sp in source_paths:
+            fmt = self._detect_format(sp)
+            if fmt == "DOCX_OOXML":
+                source_specs.append(scan_docx_style_and_page_spec(sp))
+            elif fmt == "HWP_V5_BINARY":
+                source_specs.append(scan_hwp_source_spec(sp))
+            else:
+                source_specs.append(SourceDocumentSpecIR(source_path=sp, source_format=fmt))
+
+        effective_spec = resolve_effective_document_spec(source_specs, raw_target_spec, UserSpecOverrideIR())
+        avail_w = (
+            effective_spec.section_slots[0].available_width_hu
+            if effective_spec.section_slots
+            else max(10000, effective_spec.page_width_hu - effective_spec.margin_left_hu - effective_spec.margin_right_hu)
+        )
+        tbl_sz_hu = effective_spec.table_font_size_hu
 
         all_sections: Dict[str, SectionIR] = {}
         sources_report: List[dict] = []
 
-        for sp in source_paths:
-            fmt = self._detect_format(sp)
+        for idx_s, sp in enumerate(source_paths):
+            fmt = source_specs[idx_s].source_format
+            s_spec = source_specs[idx_s]
             if fmt == "DOCX_OOXML":
-                secs = lift_docx_to_ir(sp, target_width_hu=avail_w)
+                secs = lift_docx_to_ir(sp, target_width_hu=avail_w, table_font_size_hu=tbl_sz_hu)
             elif fmt == "MARKDOWN":
                 secs = lift_markdown_to_ir(sp, target_width_hu=avail_w)
             elif fmt == "CSV":
@@ -98,6 +250,7 @@ class TdirBetaMcpServer:
                     {
                         "section_uid": s_uid,
                         "heading_text": s_obj.heading_text,
+                        "subtitle_text": s_obj.subtitle_text,
                         "non_ws_chars": s_obj.non_ws_char_count,
                         "tables_count": n_tbls,
                         "paras_count": n_paras,
@@ -109,6 +262,14 @@ class TdirBetaMcpServer:
                 {
                     "path": sp,
                     "detected_format": fmt,
+                    "source_spec": {
+                        "body_font_family": s_spec.body_font_family,
+                        "table_font_family": s_spec.table_font_family,
+                        "body_font_size_hu": s_spec.body_font_size_hu,
+                        "table_font_size_hu": s_spec.table_font_size_hu,
+                        "page_width_hu": s_spec.page_width_hu,
+                        "page_height_hu": s_spec.page_height_hu,
+                    },
                     "sections_discovered": sec_list_meta,
                 }
             )
@@ -118,84 +279,92 @@ class TdirBetaMcpServer:
             source_paths=source_paths,
             target_path=target_path,
             sections=all_sections,
-            target_spec=target_spec,
+            source_specs=source_specs,
+            raw_target_spec=raw_target_spec,
+            target_spec=effective_spec,
         )
         self.jobs[job_id] = job
 
         return {
             "job_id": job_id,
             "sources": sources_report,
-            "target_spec": {
-                "template_path": target_spec.template_path,
-                "target_format": target_spec.target_format,
-                "page_width_hu": target_spec.page_width_hu,
-                "page_height_hu": target_spec.page_height_hu,
-                "section_slots": [
-                    {
-                        "slot_uid": sl.slot_uid,
-                        "title": sl.discovered_title_text,
-                        "outer_tbl_record_idx": sl.outer_tbl_record_idx,
-                        "body_cell_record_idx": sl.body_cell_record_idx,
-                        "available_width_hu": sl.available_width_hu,
-                        "max_pages": sl.max_pages,
-                    }
-                    for sl in target_spec.section_slots
-                ],
-                "attachment_slots": [
-                    {
-                        "slot_uid": sl.slot_uid,
-                        "caption": sl.discovered_title_text,
-                        "body_cell_record_idx": sl.body_cell_record_idx,
-                        "caption_cell_record_idx": sl.caption_cell_record_idx,
-                    }
-                    for sl in target_spec.attachment_slots
-                ],
-            },
+            "target_spec": self._serialize_target_spec(effective_spec),
         }
 
-    def tdir_build_mapping_plan(self, job_id: str, user_constraints: Optional[dict] = None) -> dict:
+    def tdir_build_mapping_plan(
+        self,
+        job_id: str,
+        user_spec_overrides: Optional[dict] = None,
+        user_constraints: Optional[dict] = None,
+    ) -> dict:
         job = self.jobs[job_id]
-        constraints = user_constraints or {}
-        exclude_sections = set(constraints.get("exclude_sections", ["PREAMBLE", "Q3", "Q4", "REFERENCES"]))
-        page_budgets: Dict[str, float] = constraints.get("page_budgets", {"Q1": 2.0, "Q2": 2.0})
-        page_body_height_hu = int(constraints.get("page_body_height_hu", 78500))
+        assert job.raw_target_spec is not None
+
+        merged_dict: dict = {}
+        if user_constraints:
+            merged_dict.update(user_constraints)
+        if user_spec_overrides:
+            merged_dict.update(user_spec_overrides)
+
+        overrides_ir = UserSpecOverrideIR.from_dict(merged_dict)
+        if not overrides_ir.exclude_sections and overrides_ir.include_sections is None:
+            overrides_ir.exclude_sections = ["PREAMBLE", "Q3", "Q4", "REFERENCES"]
+
+        job.user_overrides = overrides_ir
+        job.target_spec = resolve_effective_document_spec(job.source_specs, job.raw_target_spec, overrides_ir)
+        eff_spec = job.target_spec
+
+        page_body_height_hu = compute_effective_page_body_height_hu(eff_spec, overrides_ir.page_body_height_hu)
+        self.solver = MinimumInvasionElasticSolver(page_body_height_hu=page_body_height_hu)
+
+        exclude_set = set(overrides_ir.exclude_sections)
+        include_set = set(overrides_ir.include_sections) if overrides_ir.include_sections is not None else None
 
         slot_mapping: Dict[str, str] = {}
         solver_preview: Dict[str, dict] = {}
-        assert job.target_spec is not None
 
         for s_uid, s_obj in job.sections.items():
-            if s_uid in exclude_sections:
+            if include_set is not None and s_uid not in include_set:
+                continue
+            if s_uid in exclude_set:
                 continue
             matched_slot = next(
-                (sl for sl in job.target_spec.section_slots if sl.slot_uid.startswith(s_uid)),
+                (sl for sl in eff_spec.section_slots if sl.slot_uid.startswith(s_uid)),
                 None,
             )
-            if matched_slot is None and job.target_spec.section_slots:
-                matched_slot = job.target_spec.section_slots[0]
+            if matched_slot is None and eff_spec.section_slots:
+                matched_slot = eff_spec.section_slots[0]
             if matched_slot is not None:
                 slot_mapping[s_uid] = matched_slot.slot_uid
-                max_p = float(page_budgets.get(s_uid, matched_slot.max_pages))
+                max_p = float(overrides_ir.section_page_budgets.get(s_uid, matched_slot.max_pages))
                 matched_slot.max_pages = max_p
-                self.solver.page_body_height_hu = page_body_height_hu
                 _, _, tele = self.solver.solve_section_layout_budget(
-                    s_obj.blocks, target_pages=max_p, outer_width_hu=matched_slot.available_width_hu
+                    s_obj.blocks,
+                    target_pages=max_p,
+                    outer_width_hu=matched_slot.available_width_hu,
+                    target_spec=eff_spec,
                 )
                 solver_preview[s_uid] = tele
 
-        # Also map media objects sequentially to attachment slots
-        media_idx = 0
-        for s_uid in sorted(slot_mapping.keys()):
-            for m_obj in job.sections[s_uid].media_objects:
-                if media_idx < len(job.target_spec.attachment_slots):
-                    att_slot = job.target_spec.attachment_slots[media_idx]
-                    slot_mapping[m_obj.media_uid] = att_slot.slot_uid
-                    media_idx += 1
+        if overrides_ir.route_media_to_attachment_slots:
+            media_idx = 0
+            max_imgs = (
+                overrides_ir.max_attachment_images
+                if overrides_ir.max_attachment_images is not None
+                else len(eff_spec.attachment_slots)
+            )
+            for s_uid in sorted(slot_mapping.keys()):
+                for m_obj in job.sections[s_uid].media_objects:
+                    if media_idx < len(eff_spec.attachment_slots) and media_idx < max_imgs:
+                        att_slot = eff_spec.attachment_slots[media_idx]
+                        slot_mapping[m_obj.media_uid] = att_slot.slot_uid
+                        media_idx += 1
 
         job.slot_mapping = slot_mapping
         job.solver_telemetry = solver_preview
         return {
             "job_id": job_id,
+            "effective_spec": self._serialize_target_spec(eff_spec),
             "slot_mapping": slot_mapping,
             "solver_preview": solver_preview,
         }
@@ -205,58 +374,77 @@ class TdirBetaMcpServer:
         job_id: str,
         output_prefix: str,
         output_formats: Optional[List[str]] = None,
+        page_body_height_hu: Optional[int] = None,
         base_hwpx_path: Optional[str] = None,
-        page_body_height_hu: int = 78500,
+        user_spec_overrides: Optional[dict] = None,
     ) -> dict:
         job = self.jobs[job_id]
+        assert job.raw_target_spec is not None
+
+        if user_spec_overrides is not None or not job.slot_mapping:
+            self.tdir_build_mapping_plan(job_id, user_spec_overrides=user_spec_overrides)
+
         assert job.target_spec is not None
+        eff_spec = job.target_spec
+        overrides_ir = job.user_overrides
         formats = [f.lower().lstrip(".") for f in (output_formats or ["hwp", "hwpx", "docx"])]
 
-        if not job.slot_mapping:
-            self.tdir_build_mapping_plan(job_id)
+        eff_page_body_hu = compute_effective_page_body_height_hu(
+            eff_spec,
+            page_body_height_hu if page_body_height_hu is not None else overrides_ir.page_body_height_hu,
+        )
+        self.solver = MinimumInvasionElasticSolver(page_body_height_hu=eff_page_body_hu)
 
         slot_blocks_map: Dict[str, Tuple[List[dict], ElasticLayoutState]] = {}
         attachments_hwp: List[Tuple[bytes, str]] = []
         attachments_docx: List[Tuple[Optional[bytes], str]] = []
         attachment_captions: List[str] = []
 
-        default_captions = [
-            "[붙임 1] 광운대 프리즘 (PRISM) — AI 비교과 프로그램 추천 시스템 아키텍처 및 데이터 파이프라인",
-            "[붙임 2] AI 매칭 프로세스 3단계 워크플로우 및 핵심 타겟 시장(TAM·SAM·SOM) 로드맵",
-        ]
+        max_imgs = (
+            overrides_ir.max_attachment_images
+            if overrides_ir.max_attachment_images is not None
+            else len(eff_spec.attachment_slots)
+        )
 
         for s_uid, slot_uid in job.slot_mapping.items():
             if s_uid not in job.sections:
                 continue
             s_obj = job.sections[s_uid]
-            sl_spec = next((sl for sl in job.target_spec.section_slots if sl.slot_uid == slot_uid), None)
+            sl_spec = next((sl for sl in eff_spec.section_slots if sl.slot_uid == slot_uid), None)
             avail_w = sl_spec.available_width_hu if sl_spec else 46200
             max_p = sl_spec.max_pages if sl_spec else 2.0
-            self.solver.page_body_height_hu = page_body_height_hu
             solved_blocks, el_state, tele = self.solver.solve_section_layout_budget(
-                s_obj.blocks, target_pages=max_p, outer_width_hu=avail_w
+                s_obj.blocks,
+                target_pages=max_p,
+                outer_width_hu=avail_w,
+                target_spec=eff_spec,
             )
             slot_blocks_map[slot_uid] = (solved_blocks, el_state)
             job.solver_telemetry[s_uid] = tele
 
-            for m_obj in s_obj.media_objects:
-                idx_m = len(attachments_hwp)
-                cap_str = (
-                    default_captions[idx_m]
-                    if idx_m < len(default_captions)
-                    else (m_obj.caption_hint or f"[붙임 {idx_m + 1}] {m_obj.filename}")
-                )
-                attachments_hwp.append((m_obj.raw_bytes, cap_str))
-                raw_xml_p = next(
-                    (
-                        b.get("raw_p_xml")
-                        for b in s_obj.blocks
-                        if b.get("type") == "p" and b.get("r_embed") == m_obj.rel_id
-                    ),
-                    None,
-                )
-                attachments_docx.append((raw_xml_p, cap_str))
-                attachment_captions.append(cap_str)
+            if overrides_ir.route_media_to_attachment_slots:
+                for m_obj in s_obj.media_objects:
+                    idx_m = len(attachments_hwp)
+                    if idx_m >= max_imgs:
+                        break
+                    if idx_m < len(overrides_ir.attachment_captions):
+                        cap_str = overrides_ir.attachment_captions[idx_m]
+                    elif m_obj.caption_hint:
+                        cap_str = m_obj.caption_hint
+                    else:
+                        cap_str = f"[Attachment {idx_m + 1}] {m_obj.filename}"
+
+                    attachments_hwp.append((m_obj.raw_bytes, cap_str))
+                    raw_xml_p = next(
+                        (
+                            b.get("raw_p_xml")
+                            for b in s_obj.blocks
+                            if b.get("type") == "p" and b.get("r_embed") == m_obj.rel_id
+                        ),
+                        None,
+                    )
+                    attachments_docx.append((raw_xml_p, cap_str))
+                    attachment_captions.append(cap_str)
 
         results: Dict[str, dict] = {}
         os.makedirs(os.path.dirname(os.path.abspath(output_prefix)), exist_ok=True)
@@ -264,25 +452,37 @@ class TdirBetaMcpServer:
         if "hwp" in formats:
             out_hwp = f"{output_prefix}.hwp"
             results["hwp"] = project_ir_to_hwp(
-                job.target_path, out_hwp, job.target_spec, slot_blocks_map, attachments_hwp
+                job.target_path,
+                out_hwp,
+                eff_spec,
+                slot_blocks_map,
+                attachments_hwp,
+                preserve_outer_tables=overrides_ir.preserve_outer_tables,
             )
             job.output_files["hwp"] = out_hwp
 
         if "docx" in formats and job.source_paths:
             out_docx = f"{output_prefix}.docx"
             results["docx"] = project_ir_to_docx(
-                job.source_paths[0], out_docx, slot_blocks_map, attachments_docx
+                job.source_paths[0],
+                out_docx,
+                eff_spec,
+                slot_blocks_map,
+                attachments_docx,
+                preserve_outer_tables=overrides_ir.preserve_outer_tables,
             )
             job.output_files["docx"] = out_docx
 
-        if "hwpx" in formats:
+        if "hwpx" in formats and base_hwpx_path and os.path.exists(base_hwpx_path):
             out_hwpx = f"{output_prefix}.hwpx"
-            hwpx_seed = base_hwpx_path or r"C:\Users\stella\Downloads\모창 2차 사업계획서 — 네이티브한글변환본.hwpx"
-            if os.path.exists(hwpx_seed):
-                results["hwpx"] = project_ir_to_hwpx(
-                    hwpx_seed, out_hwpx, slot_blocks_map, attachment_captions
-                )
-                job.output_files["hwpx"] = out_hwpx
+            results["hwpx"] = project_ir_to_hwpx(
+                base_hwpx_path,
+                out_hwpx,
+                eff_spec,
+                slot_blocks_map,
+                attachment_captions,
+            )
+            job.output_files["hwpx"] = out_hwpx
 
         if "md" in formats:
             out_md = f"{output_prefix}.md"
@@ -300,6 +500,7 @@ class TdirBetaMcpServer:
 
         return {
             "job_id": job_id,
+            "effective_spec": self._serialize_target_spec(eff_spec),
             "generated_files": results,
             "solver_telemetry": job.solver_telemetry,
         }
@@ -403,7 +604,10 @@ class TdirBetaMcpServer:
 MCP_TOOLS_SCHEMA = [
     {
         "name": "tdir_probe_files",
-        "description": "Dynamically inspect source documents (.docx, .hwp, .hwpx, .md, .csv, .tsv) and target template slots without hardcoding text or record offsets.",
+        "description": (
+            "Dynamically inspect source documents (.docx, .hwp, .hwpx, .md, .csv, .tsv) and target template "
+            "typography, page geometry, and slots without hardcoding text, fonts, or record offsets."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -415,19 +619,26 @@ MCP_TOOLS_SCHEMA = [
     },
     {
         "name": "tdir_build_mapping_plan",
-        "description": "Build a section-to-slot and media-to-attachment mapping plan and preview MinimumInvasionElasticSolver Early-Stop stages.",
+        "description": (
+            "Resolve effective document specifications (UserSpecOverrideIR > TargetDocumentSpecIR > SourceDocumentSpecIR), "
+            "build section-to-slot and media-to-attachment mappings, and preview MinimumInvasionElasticSolver Early-Stop stages."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "job_id": {"type": "string"},
-                "user_constraints": {"type": "object"},
+                "user_spec_overrides": USER_SPEC_OVERRIDES_JSON_SCHEMA,
+                "user_constraints": USER_SPEC_OVERRIDES_JSON_SCHEMA,
             },
             "required": ["job_id"],
         },
     },
     {
         "name": "tdir_execute_conversion",
-        "description": "Execute T-DIR v3.0 conversion into target formats (.hwp, .hwpx, .docx, .md) with 100% text preservation.",
+        "description": (
+            "Execute T-DIR v3.0 conversion into target formats (.hwp, .hwpx, .docx, .md) using dynamically resolved "
+            "specifications and optional user_spec_overrides with 100% text preservation."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -435,6 +646,7 @@ MCP_TOOLS_SCHEMA = [
                 "output_prefix": {"type": "string"},
                 "output_formats": {"type": "array", "items": {"type": "string"}},
                 "base_hwpx_path": {"type": "string"},
+                "user_spec_overrides": USER_SPEC_OVERRIDES_JSON_SCHEMA,
             },
             "required": ["job_id", "output_prefix"],
         },
