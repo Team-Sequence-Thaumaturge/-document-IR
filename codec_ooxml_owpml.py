@@ -26,6 +26,8 @@ from .ir_schema import (
     hu_to_emu,
     detect_image_format,
     extract_ordinal_index,
+    is_top_level_section_heading,
+    is_subtitle_or_instruction_line,
 )
 from .elastic_solver import (
     ElasticLayoutState,
@@ -147,6 +149,7 @@ def extract_docx_p_data(p_el: ET.Element, is_in_table: bool) -> dict:
     left_tw = 0
     right_tw = 0
     indent_tw = 0
+    outline_lvl: Optional[int] = None
     before_tw, after_tw = (0, 0) if is_in_table else (0, 8)
     if pPr is not None:
         jc_el = pPr.find(w_tag("jc"))
@@ -159,11 +162,26 @@ def extract_docx_p_data(p_el: ET.Element, is_in_table: bool) -> dict:
             first_l = int(ind_el.get(w_tag("firstLine"), "0") or 0)
             hanging = int(ind_el.get(w_tag("hanging"), "0") or 0)
             indent_tw = -hanging if hanging > 0 else first_l
+        ol_el = pPr.find(w_tag("outlineLvl"))
+        if ol_el is not None:
+            ol_val = ol_el.get(w_tag("val"), "")
+            if ol_val.isdigit():
+                outline_lvl = int(ol_val)
+        ps_el = pPr.find(w_tag("pStyle"))
+        if ps_el is not None and outline_lvl is None:
+            ps_val = ps_el.get(w_tag("val"), "").lower()
+            if ps_val in ("heading1", "heading 1", "1", "title"):
+                outline_lvl = 0
+            elif ps_val in ("heading2", "heading 2", "2"):
+                outline_lvl = 1
+            elif ps_val in ("heading3", "heading 3", "3", "heading4", "heading 4"):
+                outline_lvl = 2
 
     blip = p_el.find(f".//{{{A_NS}}}blip")
     r_embed = blip.get(f"{{{R_NS}}}embed") if blip is not None else None
 
     runs: List[dict] = []
+    max_sz_hu = 0
     for r_el in p_el.findall(f".//{w_tag('r')}"):
         t_texts = [t.text for t in r_el.findall(w_tag("t")) if t.text]
         txt = "".join(t_texts)
@@ -192,6 +210,11 @@ def extract_docx_p_data(p_el: ET.Element, is_in_table: bool) -> dict:
                 c_val = c_el.get(w_tag("val"), "000000")
                 if c_val and c_val != "auto":
                     color_hex = c_val.upper()
+            sz_el = rPr.find(w_tag("sz"))
+            if sz_el is not None:
+                hp_val = int(sz_el.get(w_tag("val"), "0") or 0)
+                if hp_val > 0:
+                    max_sz_hu = max(max_sz_hu, hp_val * 50)
         runs.append(
             {
                 "text": txt,
@@ -213,6 +236,8 @@ def extract_docx_p_data(p_el: ET.Element, is_in_table: bool) -> dict:
         "runs": runs,
         "r_embed": r_embed,
         "raw_p_xml": ET.tostring(p_el, encoding="utf-8") if r_embed else None,
+        "max_sz_hu": max_sz_hu,
+        "outline_lvl": outline_lvl,
     }
 
 
@@ -305,14 +330,27 @@ def extract_docx_tbl_normalized(
     )
 
 
+def _unwrap_sdt_elements(elems: List[ET.Element]) -> List[ET.Element]:
+    out: List[ET.Element] = []
+    for el in elems:
+        if el.tag.split("}")[-1] == "sdt":
+            sdt_c = el.find(w_tag("sdtContent"))
+            if sdt_c is not None:
+                out.extend(_unwrap_sdt_elements(list(sdt_c)))
+        else:
+            out.append(el)
+    return out
+
+
 def lift_docx_to_ir(
     docx_path: str,
     target_width_hu: int = 0,
     table_font_size_hu: int = 1000,
 ) -> Dict[str, SectionIR]:
     """
-    Dynamically scans a DOCX file, detects top-level sections by heading patterns,
-    and lifts all paragraphs, tables, and embedded media into SectionIR objects.
+    Dynamically scans a DOCX file, detects top-level sections via unsupervised typographic
+    and topological heading spectrum analysis ([NUM-01]), and lifts all paragraphs, tables,
+    and embedded media into generic SectionIR objects (SEC_01..SEC_K, PREAMBLE, REFERENCES).
     """
     sections: Dict[str, SectionIR] = {}
     with zipfile.ZipFile(docx_path, "r") as zf:
@@ -328,19 +366,25 @@ def lift_docx_to_ir(
         doc_root = ET.fromstring(zf.read("word/document.xml"))
         body = doc_root.find(w_tag("body"))
         raw_children = list(body) if body is not None else []
-        # Unwrap <w:sdt><w:sdtContent> containers recursively ([EDGE-07])
-        children: List[ET.Element] = []
-        for rc_el in raw_children:
-            if rc_el.tag.split("}")[-1] == "sdt":
-                sdt_c = rc_el.find(w_tag("sdtContent"))
-                if sdt_c is not None:
-                    children.extend(list(sdt_c))
-            else:
-                children.append(rc_el)
+        children = _unwrap_sdt_elements(raw_children)
+
+        # Compute statistical mode body font size (S_mode) across body paragraphs
+        sz_hist: Dict[int, int] = {}
+        for ch_el in children:
+            if ch_el.tag.split("}")[-1] == "p":
+                for sz_el in ch_el.findall(f".//{w_tag('sz')}"):
+                    hp = int(sz_el.get(w_tag("val"), "0") or 0)
+                    if 16 <= hp <= 28:
+                        hu_v = hp * 50
+                        sz_hist[hu_v] = sz_hist.get(hu_v, 0) + 1
+        mode_body_sz_hu = max(sz_hist.items(), key=lambda kv: kv[1])[0] if sz_hist else 1000
 
         cur_sec_id = "PREAMBLE"
         cur_heading = "Document Preamble"
         cur_subtitle = ""
+        cur_role = "PREAMBLE"
+        cur_ord: Optional[int] = None
+        sec_counter = 0
         cur_blocks: List[dict] = []
         cur_media: List[MediaObjectIR] = []
 
@@ -357,6 +401,8 @@ def lift_docx_to_ir(
                 media_objects=cur_media,
                 non_ws_char_count=n_chars,
                 text_sha256=sha,
+                ordinal_index=cur_ord,
+                section_role=cur_role,
             )
             cur_blocks = []
             cur_media = []
@@ -369,35 +415,36 @@ def lift_docx_to_ir(
             if tag == "p":
                 pdata = extract_docx_p_data(ch, is_in_table=False)
                 ptxt = "".join(r["text"] for r in pdata["runs"]).strip()
+                p_max_sz = pdata.get("max_sz_hu", 0) or mode_body_sz_hu
+                p_is_bold = bool(pdata["runs"]) and all(r.get("bold", False) for r in pdata["runs"])
+                p_outline = pdata.get("outline_lvl")
 
-                new_sec_key = None
-                if ptxt.startswith("Q1.") or ptxt.startswith("1. 문제"):
-                    new_sec_key = "Q1"
-                elif ptxt.startswith("Q2.") or ptxt.startswith("2. 실현") or ptxt.startswith("Q2 "):
-                    new_sec_key = "Q2"
-                elif ptxt.startswith("Q3.") or ptxt.startswith("3. 성장"):
-                    new_sec_key = "Q3"
-                elif ptxt.startswith("Q4.") or ptxt.startswith("4. 향후"):
-                    new_sec_key = "Q4"
-                elif ptxt == "출처" or ptxt.startswith("[출처]"):
-                    new_sec_key = "REFERENCES"
-                elif ptxt.startswith(("Q", "q")) and extract_ordinal_index(ptxt) is not None:
-                    new_sec_key = f"Q{extract_ordinal_index(ptxt)}"
+                is_hdr, hdr_role = is_top_level_section_heading(
+                    ptxt,
+                    p_max_sz_hu=p_max_sz,
+                    p_is_bold=p_is_bold,
+                    p_outline_lvl=p_outline,
+                    mode_body_sz_hu=mode_body_sz_hu,
+                    is_in_table=False,
+                )
 
-                if new_sec_key is not None:
+                if is_hdr:
                     flush_section()
-                    cur_sec_id = new_sec_key
+                    if hdr_role == "REFERENCE":
+                        cur_sec_id = "REFERENCES"
+                        cur_role = "REFERENCE"
+                        cur_ord = None
+                    else:
+                        sec_counter += 1
+                        cur_sec_id = f"SEC_{sec_counter:02d}"
+                        cur_role = "BODY"
+                        cur_ord = extract_ordinal_index(ptxt) or sec_counter
                     cur_heading = ptxt
                     if i + 1 < len(children) and children[i + 1].tag.split("}")[-1] == "p":
                         nxt_p = extract_docx_p_data(children[i + 1], is_in_table=False)
                         nxt_txt = "".join(r["text"] for r in nxt_p["runs"]).strip()
-                        if (
-                            "아이디어의 개발" in nxt_txt
-                            or "사업화 계획" in nxt_txt
-                            or "문제 인식" in nxt_txt
-                            or "해결 방안" in nxt_txt
-                            or nxt_txt.startswith("※")
-                        ):
+                        nxt_sz = nxt_p.get("max_sz_hu", 0) or mode_body_sz_hu
+                        if is_subtitle_or_instruction_line(nxt_txt, nxt_sz, mode_body_sz_hu):
                             cur_subtitle = nxt_txt
                             i += 2
                             continue
@@ -445,6 +492,7 @@ def project_ir_to_docx(
     slot_blocks_map: Dict[str, Tuple[List[dict], ElasticLayoutState]],
     media_drawings: List[Tuple[Optional[bytes], str]],
     preserve_outer_tables: bool = True,
+    clear_unmapped_slots: bool = False,
 ) -> dict:
     """
     Projects the solved T-DIR blocks into a DOCX file using the effective `target_spec`
@@ -819,7 +867,8 @@ def project_ir_to_docx(
             return tbl
 
         # 1. Dynamic Preamble / Cover Page from target_spec.preamble_blocks
-        if target_spec.preamble_blocks:
+        has_preamble_cover = bool(target_spec.preamble_blocks) and preserve_outer_tables
+        if has_preamble_cover:
             default_outer_tw = (
                 hu_to_twips(target_spec.section_slots[0].outer_width_hu)
                 if target_spec.section_slots and target_spec.section_slots[0].outer_width_hu > 0
@@ -856,8 +905,13 @@ def project_ir_to_docx(
 
         # 2. Dynamic Section Slots (2x2 Outer Tables or Unwrapped Blocks)
         default_state = ElasticLayoutState()
+        rendered_slot_count = 0
         for s_slot in target_spec.section_slots:
+            if (clear_unmapped_slots or not preserve_outer_tables) and s_slot.slot_uid not in slot_blocks_map:
+                continue
             blks_s, st_s = slot_blocks_map.get(s_slot.slot_uid, ([], default_state))
+            need_pb = has_preamble_cover or (rendered_slot_count > 0)
+            rendered_slot_count += 1
             body.append(make_w_p("", sz_half_pt=2, font_name=body_font, before_tw=0, after_tw=0, line_tw=20, line_rule="exact"))
             if preserve_outer_tables:
                 body.append(
@@ -866,7 +920,7 @@ def project_ir_to_docx(
                         s_slot.discovered_subtitle_text,
                         blks_s,
                         st_s,
-                        page_break_before=True,
+                        page_break_before=need_pb,
                         s_slot=s_slot,
                     )
                 )
@@ -877,7 +931,7 @@ def project_ir_to_docx(
                         sz_half_pt=body_sz_hp + 4,
                         font_name=body_font,
                         bold=True,
-                        page_break=True,
+                        page_break=need_pb,
                     )
                 )
                 for blk in blks_s:
@@ -897,8 +951,8 @@ def project_ir_to_docx(
                     elif blk["type"] == "tbl":
                         body.append(build_w_tbl_from_block(blk, st_s.table_line_tw))
 
-        # 3. Dynamic Attachment Table ('붙임') from target_spec.attachment_slots
-        if target_spec.attachment_slots:
+        # 3. Dynamic 2R x C Attachment Media Grid Table from target_spec.attachment_slots
+        if target_spec.attachment_slots and preserve_outer_tables:
             for idx_ah, ah_p in enumerate(target_spec.attachment_header_paras):
                 ah_sz = hu_to_half_pt(ah_p.get("height_hu", target_spec.body_font_size_hu))
                 body.append(
@@ -917,8 +971,9 @@ def project_ir_to_docx(
                 )
 
             att0 = target_spec.attachment_slots[0]
+            g_cols = max(1, att0.grid_cols)
             att_col_tw = hu_to_twips(att0.available_width_hu) if att0.available_width_hu > 0 else 4762
-            att_outer_tw = att_col_tw * 2
+            att_outer_tw = att_col_tw * g_cols
             img_row_h_tw = max(2400, int(round(hu_to_twips(att0.available_height_hu) * 0.86)))
             cap_row_h_tw = max(360, hu_to_twips(att0.header_height_hu)) if att0.header_height_hu > 0 else 415
             target_cx_emu = hu_to_emu(int(att0.available_width_hu * 0.96))
@@ -932,8 +987,8 @@ def project_ir_to_docx(
             ET.SubElement(aPr, w_tag("jc"), {w_tag("val"): "center"})
             ET.SubElement(aPr, w_tag("tblLayout"), {w_tag("type"): "fixed"})
             aGrid = ET.SubElement(att_tbl, w_tag("tblGrid"))
-            ET.SubElement(aGrid, w_tag("gridCol"), {w_tag("w"): str(att_col_tw)})
-            ET.SubElement(aGrid, w_tag("gridCol"), {w_tag("w"): str(att_col_tw)})
+            for _ in range(g_cols):
+                ET.SubElement(aGrid, w_tag("gridCol"), {w_tag("w"): str(att_col_tw)})
 
             def scale_drawing_xml(raw_p_xml: bytes, target_cx: int, target_cy: int) -> ET.Element:
                 p_copy = ET.fromstring(raw_p_xml)
@@ -958,13 +1013,13 @@ def project_ir_to_docx(
                         aext.set("cy", str(target_cy))
                 return p_copy
 
-            n_pairs = max(1, len(target_spec.attachment_slots) // 2)
+            n_pairs = max(1, len(target_spec.attachment_slots) // g_cols)
             for pair_idx in range(n_pairs):
                 tr_img = ET.SubElement(att_tbl, w_tag("tr"))
                 tr_imgPr = ET.SubElement(tr_img, w_tag("trPr"))
                 ET.SubElement(tr_imgPr, w_tag("trHeight"), {w_tag("val"): str(img_row_h_tw), w_tag("hRule"): "atLeast"})
-                for col_i in range(2):
-                    slot_flat_idx = pair_idx * 2 + col_i
+                for col_i in range(g_cols):
+                    slot_flat_idx = pair_idx * g_cols + col_i
                     tc = ET.SubElement(tr_img, w_tag("tc"))
                     tcPr = ET.SubElement(tc, w_tag("tcPr"))
                     ET.SubElement(tcPr, w_tag("tcW"), {w_tag("w"): str(att_col_tw), w_tag("type"): "dxa"})
@@ -988,8 +1043,8 @@ def project_ir_to_docx(
                 tr_cap = ET.SubElement(att_tbl, w_tag("tr"))
                 tr_capPr = ET.SubElement(tr_cap, w_tag("trPr"))
                 ET.SubElement(tr_capPr, w_tag("trHeight"), {w_tag("val"): str(cap_row_h_tw), w_tag("hRule"): "atLeast"})
-                for col_i in range(2):
-                    slot_flat_idx = pair_idx * 2 + col_i
+                for col_i in range(g_cols):
+                    slot_flat_idx = pair_idx * g_cols + col_i
                     tc = ET.SubElement(tr_cap, w_tag("tc"))
                     tcPr = ET.SubElement(tc, w_tag("tcPr"))
                     ET.SubElement(tcPr, w_tag("tcW"), {w_tag("w"): str(att_col_tw), w_tag("type"): "dxa"})

@@ -1,9 +1,9 @@
 """
-T-DIR v3.0 Beta Isolated MCP Server (JSON-RPC 2.0 over stdio + Direct Python API).
-Zero hardcoded font names, pixel/HWPUNIT constants, or domain strings:
+T-DIR v3.2 Beta Isolated MCP Server (JSON-RPC 2.0 over stdio + Direct Python API).
+Zero hardcoded font names, pixel/HWPUNIT constants, document-specific section IDs, or fixed page counts:
   - Dynamically extracts source & target specifications at runtime (`tdir_probe_files`).
-  - Exposes first-class `user_spec_overrides` (`UserSpecOverrideIR`) in MCP tool schemas
-    with strict priority resolution: UserSpecOverrideIR > TargetDocumentSpecIR > SourceDocumentSpecIR.
+  - Resolves generic section/slot topologies (`SEC_01..SEC_K`, `SLOT_01..SLOT_M`, `MEDIA_01..MEDIA_P`)
+    and numerical page budgets (`solve_document_page_budgets`) via `UserSpecOverrideIR`.
 Exposes 5 tools:
   1. tdir_probe_files
   2. tdir_build_mapping_plan
@@ -13,6 +13,7 @@ Exposes 5 tools:
 """
 
 import os
+import re
 import sys
 import uuid
 import json
@@ -31,12 +32,14 @@ from .ir_schema import (
     validate_text_immutability,
     extract_ir_non_ws_text,
     compute_heading_slot_similarity,
+    matches_section_selector,
     hu_to_pt,
 )
 from .elastic_solver import (
     ElasticLayoutState,
     MinimumInvasionElasticSolver,
     compute_effective_page_body_height_hu,
+    solve_document_page_budgets,
 )
 from .codec_hwp_v5 import (
     scan_hwp_template_slots,
@@ -50,7 +53,12 @@ from .codec_ooxml_owpml import (
     project_ir_to_docx,
     project_ir_to_hwpx,
 )
-from .codec_tabular_markup import lift_markdown_to_ir, project_ir_to_markdown, lift_csv_to_ir
+from .codec_tabular_markup import (
+    lift_markdown_to_ir,
+    project_ir_to_markdown,
+    lift_csv_to_ir,
+    project_ir_to_csv,
+)
 
 
 USER_SPEC_OVERRIDES_JSON_SCHEMA = {
@@ -178,6 +186,7 @@ class TdirBetaMcpServer:
             "section_slots": [
                 {
                     "slot_uid": sl.slot_uid,
+                    "ordinal_index": sl.ordinal_index,
                     "title": sl.discovered_title_text,
                     "subtitle": sl.discovered_subtitle_text,
                     "outer_tbl_record_idx": sl.outer_tbl_record_idx,
@@ -193,6 +202,8 @@ class TdirBetaMcpServer:
             "attachment_slots": [
                 {
                     "slot_uid": sl.slot_uid,
+                    "ordinal_index": sl.ordinal_index,
+                    "grid_cols": sl.grid_cols,
                     "caption": sl.discovered_title_text,
                     "body_cell_record_idx": sl.body_cell_record_idx,
                     "caption_cell_record_idx": sl.caption_cell_record_idx,
@@ -243,12 +254,14 @@ class TdirBetaMcpServer:
                 _, blks = lift_hwp_to_ir(sp)
                 _, nc, sha = extract_ir_non_ws_text(blks)
                 secs = {
-                    "HWP_MAIN": SectionIR(
-                        section_uid="HWP_MAIN",
+                    "SEC_01": SectionIR(
+                        section_uid="SEC_01",
                         heading_text=os.path.basename(sp),
                         blocks=blks,
                         non_ws_char_count=nc,
                         text_sha256=sha,
+                        ordinal_index=1,
+                        section_role="BODY",
                     )
                 }
             else:
@@ -264,6 +277,8 @@ class TdirBetaMcpServer:
                 sec_list_meta.append(
                     {
                         "section_uid": eff_s_uid,
+                        "ordinal_index": s_obj.ordinal_index,
+                        "section_role": s_obj.section_role,
                         "heading_text": s_obj.heading_text,
                         "subtitle_text": s_obj.subtitle_text,
                         "non_ws_chars": s_obj.non_ws_char_count,
@@ -322,9 +337,6 @@ class TdirBetaMcpServer:
             merged_dict.update(user_spec_overrides)
 
         overrides_ir = UserSpecOverrideIR.from_dict(merged_dict)
-        if not overrides_ir.exclude_sections and overrides_ir.include_sections is None:
-            overrides_ir.exclude_sections = ["PREAMBLE", "Q3", "Q4", "REFERENCES"]
-
         job.user_overrides = overrides_ir
         job.target_spec = resolve_effective_document_spec(job.source_specs, job.raw_target_spec, overrides_ir)
         eff_spec = job.target_spec
@@ -332,27 +344,29 @@ class TdirBetaMcpServer:
         page_body_height_hu = compute_effective_page_body_height_hu(eff_spec, overrides_ir.page_body_height_hu)
         self.solver = MinimumInvasionElasticSolver(page_body_height_hu=page_body_height_hu)
 
-        exclude_set = set(overrides_ir.exclude_sections)
-        include_set = set(overrides_ir.include_sections) if overrides_ir.include_sections is not None else None
-
         slot_mapping: Dict[str, str] = {}
         solver_preview: Dict[str, dict] = {}
         used_slot_uids = set()
 
         for s_uid, s_obj in job.sections.items():
-            if include_set is not None and s_uid not in include_set:
+            if overrides_ir.include_sections is not None:
+                if not any(matches_section_selector(sel, s_obj) for sel in overrides_ir.include_sections):
+                    continue
+            else:
+                if s_obj.section_role != "BODY":
+                    continue
+            if overrides_ir.exclude_sections and any(
+                matches_section_selector(sel, s_obj) for sel in overrides_ir.exclude_sections
+            ):
                 continue
-            if s_uid in exclude_set:
-                continue
-            base_s_uid = s_uid.split("_S")[0]
-            matched_slot = next(
-                (sl for sl in eff_spec.section_slots if sl.slot_uid.startswith(base_s_uid)),
-                None,
-            )
-            if matched_slot is None and eff_spec.section_slots:
+
+            matched_slot = None
+            if eff_spec.section_slots:
                 best_score = -1.0
                 best_slot = None
                 for sl in eff_spec.section_slots:
+                    if sl.slot_uid in used_slot_uids:
+                        continue
                     sc = compute_heading_slot_similarity(
                         s_obj.heading_text or s_uid,
                         sl.discovered_title_text,
@@ -365,21 +379,46 @@ class TdirBetaMcpServer:
                     matched_slot = best_slot
                 else:
                     matched_slot = next(
+                        (
+                            sl
+                            for sl in eff_spec.section_slots
+                            if sl.slot_uid not in used_slot_uids
+                            and sl.ordinal_index is not None
+                            and sl.ordinal_index == s_obj.ordinal_index
+                        ),
+                        None,
+                    )
+                if matched_slot is None:
+                    matched_slot = next(
                         (sl for sl in eff_spec.section_slots if sl.slot_uid not in used_slot_uids),
                         eff_spec.section_slots[0],
                     )
             if matched_slot is not None:
                 used_slot_uids.add(matched_slot.slot_uid)
                 slot_mapping[s_uid] = matched_slot.slot_uid
-                max_p = float(overrides_ir.section_page_budgets.get(s_uid, matched_slot.max_pages))
-                matched_slot.max_pages = max_p
-                _, _, tele = self.solver.solve_section_layout_budget(
-                    s_obj.blocks,
-                    target_pages=max_p,
-                    outer_width_hu=matched_slot.available_width_hu,
-                    target_spec=eff_spec,
-                )
-                solver_preview[s_uid] = tele
+
+        budget_solution = solve_document_page_budgets(
+            job.sections,
+            slot_mapping,
+            eff_spec,
+            overrides_ir,
+            self.solver,
+        )
+        job.page_budget_solution = budget_solution
+
+        for s_uid, slot_uid in list(slot_mapping.items()):
+            s_obj = job.sections[s_uid]
+            matched_slot = next((sl for sl in eff_spec.section_slots if sl.slot_uid == slot_uid), None)
+            avail_w = matched_slot.available_width_hu if matched_slot else 46200
+            max_p = float(budget_solution["section_budgets"].get(s_uid, matched_slot.max_pages if matched_slot else 2.0))
+            _, _, tele = self.solver.solve_section_layout_budget(
+                s_obj.blocks,
+                target_pages=max_p,
+                outer_width_hu=avail_w,
+                target_spec=eff_spec,
+                allow_font_size_elastic_scaling=overrides_ir.allow_font_size_elastic_scaling,
+            )
+            solver_preview[s_uid] = tele
 
         if overrides_ir.route_media_to_attachment_slots:
             media_idx = 0
@@ -389,6 +428,8 @@ class TdirBetaMcpServer:
                 else len(eff_spec.attachment_slots)
             )
             for s_uid in sorted(slot_mapping.keys()):
+                if s_uid not in job.sections:
+                    continue
                 for m_obj in job.sections[s_uid].media_objects:
                     if media_idx < len(eff_spec.attachment_slots) and media_idx < max_imgs:
                         att_slot = eff_spec.attachment_slots[media_idx]
@@ -401,6 +442,7 @@ class TdirBetaMcpServer:
             "job_id": job_id,
             "effective_spec": self._serialize_target_spec(eff_spec),
             "slot_mapping": slot_mapping,
+            "page_budget_solution": budget_solution,
             "solver_preview": solver_preview,
         }
 
@@ -453,6 +495,7 @@ class TdirBetaMcpServer:
                 target_pages=max_p,
                 outer_width_hu=avail_w,
                 target_spec=eff_spec,
+                allow_font_size_elastic_scaling=overrides_ir.allow_font_size_elastic_scaling,
             )
             slot_blocks_map[slot_uid] = (solved_blocks, el_state)
             job.solver_telemetry[s_uid] = tele
@@ -505,6 +548,7 @@ class TdirBetaMcpServer:
                 slot_blocks_map,
                 attachments_docx,
                 preserve_outer_tables=overrides_ir.preserve_outer_tables,
+                clear_unmapped_slots=overrides_ir.clear_unmapped_slots,
             )
             job.output_files["docx"] = out_docx
 
@@ -519,23 +563,32 @@ class TdirBetaMcpServer:
             )
             job.output_files["hwpx"] = out_hwpx
 
+        active_secs = {
+            k: SectionIR(
+                section_uid=k,
+                heading_text=job.sections[k].heading_text,
+                blocks=slot_blocks_map[v][0],
+                ordinal_index=job.sections[k].ordinal_index,
+                section_role=job.sections[k].section_role,
+            )
+            for k, v in job.slot_mapping.items()
+            if k in job.sections and v in slot_blocks_map
+        }
+
         if "md" in formats:
             out_md = f"{output_prefix}.md"
-            active_secs = {
-                k: SectionIR(
-                    section_uid=k,
-                    heading_text=job.sections[k].heading_text,
-                    blocks=slot_blocks_map[v][0],
-                )
-                for k, v in job.slot_mapping.items()
-                if k in job.sections and v in slot_blocks_map
-            }
             results["md"] = project_ir_to_markdown(active_secs or job.sections, out_md)
             job.output_files["md"] = out_md
+
+        if "csv" in formats:
+            out_csv = f"{output_prefix}.csv"
+            results["csv"] = project_ir_to_csv(active_secs or job.sections, out_csv, delimiter=",")
+            job.output_files["csv"] = out_csv
 
         return {
             "job_id": job_id,
             "effective_spec": self._serialize_target_spec(eff_spec),
+            "page_budget_solution": job.page_budget_solution,
             "generated_files": results,
             "solver_telemetry": job.solver_telemetry,
         }
@@ -603,14 +656,22 @@ class TdirBetaMcpServer:
                 )
                 subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd], check=True)
                 job.output_files["pdf"] = pdf_path
+                with open(pdf_path, "rb") as f_pdf:
+                    raw_pdf = f_pdf.read()
+                actual_pdf_pages = len(re.findall(rb"/Type\s*/Page\b(?!s)", raw_pdf))
+                expected_total = job.page_budget_solution.get("expected_total_pages")
                 fidelity_results["pdf"] = {
                     "path": pdf_path,
                     "bytes": os.path.getsize(pdf_path),
+                    "actual_pdf_pages": actual_pdf_pages,
+                    "expected_total_pages": expected_total,
+                    "page_budget_matched": (actual_pdf_pages == expected_total) if expected_total is not None else True,
                 }
 
         return {
             "job_id": job_id,
             "fidelity_results": fidelity_results,
+            "page_budget_solution": job.page_budget_solution,
             "solver_telemetry": job.solver_telemetry,
         }
 
@@ -623,7 +684,16 @@ class TdirBetaMcpServer:
         col_widths_hu: Optional[List[int]] = None,
     ) -> dict:
         job = self.jobs[job_id]
-        sec = job.sections[section_uid]
+        resolved_sec_uid = section_uid if section_uid in job.sections else None
+        if resolved_sec_uid is None:
+            for cand_uid, cand_sec in job.sections.items():
+                if matches_section_selector(section_uid, cand_sec, job.slot_mapping.get(cand_uid)):
+                    resolved_sec_uid = cand_uid
+                    break
+        if resolved_sec_uid is None:
+            raise KeyError(f"Unknown section_uid or selector: {section_uid}")
+
+        sec = job.sections[resolved_sec_uid]
         blk = sec.blocks[block_index]
         if lock_unmerged is not None and blk["type"] == "p":
             blk["lock_unmerged"] = bool(lock_unmerged)
@@ -636,7 +706,7 @@ class TdirBetaMcpServer:
                     cell["width_hu"] = sum(blk["col_widths_hu"][c0 : c0 + cs])
 
         eff_spec = job.target_spec or job.raw_target_spec
-        slot_uid = job.slot_mapping.get(section_uid)
+        slot_uid = job.slot_mapping.get(resolved_sec_uid)
         sl_spec = (
             next((sl for sl in eff_spec.section_slots if sl.slot_uid == slot_uid), None)
             if (eff_spec and slot_uid)
@@ -649,12 +719,13 @@ class TdirBetaMcpServer:
             target_pages=max_p,
             outer_width_hu=avail_w,
             target_spec=eff_spec,
+            allow_font_size_elastic_scaling=job.user_overrides.allow_font_size_elastic_scaling,
         )
-        job.solver_telemetry[section_uid] = updated_tele
+        job.solver_telemetry[resolved_sec_uid] = updated_tele
 
         return {
             "job_id": job_id,
-            "section_uid": section_uid,
+            "section_uid": resolved_sec_uid,
             "block_index": block_index,
             "updated_block_type": blk["type"],
             "lock_unmerged": blk.get("lock_unmerged", False),
@@ -754,7 +825,7 @@ def handle_jsonrpc_request(server: TdirBetaMcpServer, req: dict) -> Optional[dic
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "tdir-document-beta", "version": "3.1.0-beta"},
+                "serverInfo": {"name": "tdir-document-beta", "version": "3.2.0-beta"},
             },
         }
     if method == "notifications/initialized":

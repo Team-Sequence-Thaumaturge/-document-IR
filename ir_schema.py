@@ -1,8 +1,8 @@
 """
-T-DIR v3.1 Universal Document Intermediate Representation Schema, Dynamic Spec Resolver,
-Mixed-Script Width Estimator, Bipartite Slot Matcher, and Cryptographic Verifier.
-Zero hardcoded font names or pixel/HWPUNIT constants: all typography and geometry are
-resolved via the priority chain:
+T-DIR v3.2 Universal Document Intermediate Representation Schema, Dynamic Spec Resolver,
+Unsupervised Heading Spectrum Detector, Universal Selector Matcher, Mixed-Script Width Estimator,
+Bipartite Slot Matcher, and Cryptographic Verifier.
+Zero hardcoded font names, pixel/HWPUNIT constants, or document-specific section/slot IDs:
   1. UserSpecOverrideIR (Explicit user/MCP specification)
   2. TargetDocumentSpecIR (Dynamically extracted from target template file)
   3. SourceDocumentSpecIR (Dynamically extracted from source document file)
@@ -79,24 +79,172 @@ def compute_weighted_text_units(txt: str) -> float:
 
 def extract_ordinal_index(text: str) -> Optional[int]:
     """
-    Extracts leading ordinal index from section headings or slot titles
-    (e.g. 'Q1.', '1.', '제2장', '[3]', 'Ⅰ.', 'Ⅱ.').
+    Extracts leading ordinal index from section headings, slot titles, or selector strings
+    (e.g. 'SEC_01', 'SLOT_02', 'Q1.', '1.', '제2장', '[3]', 'Ⅰ.', 'II.', 'Chapter 3').
+    Avoids matching sub-ordinals like '1-1.' or '1.2'.
     """
     s = text.strip()
-    m_q = re.match(r"^[Qq]\s*(\d+)\b", s)
+    if not s or re.match(r"^\d+[\-\.]\d+", s):
+        return None
+    m_uid = re.match(r"^(?:SEC|SLOT|ATTACH|MEDIA)[_\-\s]*0*(\d+)\b", s, re.IGNORECASE)
+    if m_uid:
+        return int(m_uid.group(1))
+    m_q = re.match(r"^[Qq]\s*0*(\d+)\b", s)
     if m_q:
         return int(m_q.group(1))
-    m_num = re.match(r"^[\[<\(]?\s*(\d+)\s*[\.\]\>\)]", s)
+    m_ch_en = re.match(r"^(?:Chapter|Section|Part)\s+0*(\d+)\b", s, re.IGNORECASE)
+    if m_ch_en:
+        return int(m_ch_en.group(1))
+    m_num = re.match(r"^[\[<\(]?\s*0*(\d+)\s*[\.\]\>\)]", s)
     if m_num:
         return int(m_num.group(1))
-    m_ch = re.match(r"^제\s*(\d+)\s*[장절항문]", s)
+    m_ch = re.match(r"^제\s*0*(\d+)\s*[장절항문편부]", s)
     if m_ch:
         return int(m_ch.group(1))
-    roman_map = {"Ⅰ": 1, "Ⅱ": 2, "Ⅲ": 3, "Ⅳ": 4, "Ⅴ": 5, "I.": 1, "II.": 2, "III.": 3, "IV.": 4}
-    for rk, rv in roman_map.items():
-        if s.startswith(rk):
-            return rv
+    if s.isdigit():
+        return int(s)
+    roman_unicode = {
+        "Ⅰ": 1,
+        "Ⅱ": 2,
+        "Ⅲ": 3,
+        "Ⅳ": 4,
+        "Ⅴ": 5,
+        "Ⅵ": 6,
+        "Ⅶ": 7,
+        "Ⅷ": 8,
+        "Ⅸ": 9,
+        "Ⅹ": 10,
+    }
+    if s[0] in roman_unicode:
+        return roman_unicode[s[0]]
+    m_rom = re.match(r"^(X|IX|VIII|VII|VI|V|IV|III|II|I)[\.\)\s]", s)
+    if m_rom:
+        rom_ascii = {
+            "I": 1,
+            "II": 2,
+            "III": 3,
+            "IV": 4,
+            "V": 5,
+            "VI": 6,
+            "VII": 7,
+            "VIII": 8,
+            "IX": 9,
+            "X": 10,
+        }
+        return rom_ascii.get(m_rom.group(1))
     return None
+
+
+def is_top_level_section_heading(
+    ptxt: str,
+    p_max_sz_hu: int,
+    p_is_bold: bool,
+    p_outline_lvl: Optional[int],
+    mode_body_sz_hu: int,
+    is_in_table: bool = False,
+) -> Tuple[bool, str]:
+    """
+    Unsupervised typographic and topological top-level section heading detector ([NUM-01]).
+    Detects top-level sections across arbitrary document domains without hardcoded title strings.
+    Returns (is_heading, section_role) where section_role in {'BODY', 'REFERENCE'}.
+    """
+    s = ptxt.strip()
+    if is_in_table or not s or len(s) > 95:
+        return False, "BODY"
+
+    if re.match(
+        r"^\[?\s*(?:출처|참고\s*문헌|References?|Bibliography)(?:\s*[\(\[（].*[\)\]）]|\s*\]?)$",
+        s,
+        re.IGNORECASE,
+    ):
+        return True, "REFERENCE"
+
+    bullet_prefixes = (
+        "■",
+        "□",
+        "●",
+        "○",
+        "•",
+        "◦",
+        "◆",
+        "◇",
+        "-",
+        "–",
+        "—",
+        "※",
+        "*",
+        "▸",
+        "▹",
+        "▶",
+        "▷",
+        "(",
+        "①",
+        "②",
+        "③",
+        "④",
+        "⑤",
+        "가.",
+        "나.",
+        "다.",
+        "라.",
+    )
+    if s.startswith(bullet_prefixes) or re.match(r"^\d+[\-\.]\d+", s):
+        return False, "BODY"
+
+    if p_outline_lvl is not None:
+        if p_outline_lvl == 0:
+            return True, "BODY"
+        return False, "BODY"
+
+    # Explicit structural chapter/section prefixes (e.g. '제1장', 'Ⅰ.', 'I.', 'Chapter 1', 'Q1.')
+    if (
+        (
+            re.match(r"^[Qq]\s*\d+[\.\s]", s)
+            or re.match(r"^제\s*\d+\s*[장절편부]", s)
+            or re.match(r"^(?:Chapter|Section|Part)\s+\d+\b", s, re.IGNORECASE)
+            or re.match(r"^[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ][\.\)\s]", s)
+            or re.match(r"^(?:X|IX|VIII|VII|VI|V|IV|III|II|I)\.\s+\S+", s)
+        )
+        and len(s) <= 85
+        and not s.endswith(("다.", "입니다.", "함.", "음."))
+    ):
+        return True, "BODY"
+
+    # Typographic size jump relative to the document's mode body font size (S_mode)
+    eff_mode_hu = mode_body_sz_hu if mode_body_sz_hu > 0 else 1000
+    if (
+        p_max_sz_hu >= eff_mode_hu + 150
+        and (p_is_bold or p_max_sz_hu >= eff_mode_hu + 200)
+        and len(s) <= 75
+        and not s.endswith((".", "다", "함", "음", ",", ";"))
+    ):
+        return True, "BODY"
+
+    return False, "BODY"
+
+
+def is_subtitle_or_instruction_line(ptxt: str, p_max_sz_hu: int, mode_body_sz_hu: int) -> bool:
+    """
+    Domain-agnostic detector for a single subtitle or instruction line immediately following
+    a top-level section heading (replacing hardcoded strings like '아이디어의 개발').
+    """
+    s = ptxt.strip()
+    if not s or len(s) > 110:
+        return False
+    if s.startswith(("■", "□", "●", "○", "•", "-", "1.", "2.", "3.", "Q", "제1", "Ⅰ", "I.")):
+        return False
+    if s.startswith(("※", "*", "▸", "▹")):
+        return True
+    eff_mode_hu = mode_body_sz_hu if mode_body_sz_hu > 0 else 1000
+    if (
+        len(s) <= 85
+        and "(" in s
+        and ")" in s
+        and p_max_sz_hu <= eff_mode_hu + 50
+        and not s.endswith((".", "다", "함", "음"))
+    ):
+        return True
+    return False
 
 
 def compute_heading_slot_similarity(heading_txt: str, slot_title_txt: str, slot_uid: str = "") -> float:
@@ -198,6 +346,8 @@ class SectionIR:
     media_objects: List[MediaObjectIR] = field(default_factory=list)
     non_ws_char_count: int = 0
     text_sha256: str = ""
+    ordinal_index: Optional[int] = None
+    section_role: str = "BODY"
 
 
 @dataclass
@@ -217,6 +367,69 @@ class SlotSpecIR:
     available_width_hu: int = 0
     available_height_hu: int = 0
     max_pages: float = 2.0
+    ordinal_index: Optional[int] = None
+    grid_cols: int = 2
+
+
+def matches_section_selector(
+    selector: str,
+    sec: SectionIR,
+    matched_slot_uid: Optional[str] = None,
+) -> bool:
+    """
+    Universal selector matcher supporting generic UIDs ('SEC_01', 'SLOT_01'),
+    structural roles ('PREAMBLE', 'REFERENCES'), ordinal aliases ('Q1', '1', '제1장', 'I.'),
+    and heading substrings ([NUM-02]).
+    """
+    sel = selector.strip()
+    if not sel:
+        return False
+    sel_up = sel.upper()
+    uid_up = sec.section_uid.upper()
+    base_uid_up = uid_up.split("_S")[0]
+    if sel_up in (uid_up, base_uid_up):
+        return True
+    if matched_slot_uid and sel_up == matched_slot_uid.upper():
+        return True
+    if sel_up == "PREAMBLE" and sec.section_role == "PREAMBLE":
+        return True
+    if sel_up in ("REFERENCES", "REFERENCE") and sec.section_role == "REFERENCE":
+        return True
+    # Only match bare ordinal aliases against primary (non-secondary _S2) body sections
+    if "_S" not in uid_up and sec.section_role == "BODY":
+        sel_ord = extract_ordinal_index(sel)
+        sec_ord = sec.ordinal_index or extract_ordinal_index(sec.heading_text) or extract_ordinal_index(sec.section_uid)
+        if sel_ord is not None and sec_ord is not None and sel_ord == sec_ord:
+            return True
+    if len(sel) >= 2 and sel.lower() in sec.heading_text.lower():
+        return True
+    return False
+
+
+def resolve_budget_for_section_or_slot(
+    budgets_map: Dict[str, float],
+    sec: Optional[SectionIR],
+    slot: Optional[SlotSpecIR],
+) -> Optional[float]:
+    """
+    Resolves a numerical page budget for a section or slot from `section_page_budgets`
+    whether keyed by 'SEC_01', 'SLOT_01', 'Q1', '1', or title substring ([NUM-04]).
+    """
+    if not budgets_map:
+        return None
+    for k, val in budgets_map.items():
+        if sec is not None and matches_section_selector(k, sec, slot.slot_uid if slot else None):
+            return float(val)
+        if slot is not None:
+            k_up = k.strip().upper()
+            sl_up = slot.slot_uid.upper()
+            if k_up == sl_up or sl_up.startswith(f"{k_up}_"):
+                return float(val)
+            k_ord = extract_ordinal_index(k)
+            sl_ord = slot.ordinal_index or extract_ordinal_index(slot.discovered_title_text) or extract_ordinal_index(slot.slot_uid)
+            if k_ord is not None and sl_ord is not None and k_ord == sl_ord:
+                return float(val)
+    return None
 
 
 @dataclass
@@ -421,11 +634,11 @@ def resolve_effective_document_spec(
         if "right" in user_overrides.margins_mm:
             eff.margin_right_hu = mm_to_hu(user_overrides.margins_mm["right"])
 
-    # 5. Apply Section Page Budgets to Discovered Slots
+    # 5. Apply Section Page Budgets to Discovered Slots via Universal Selector Resolution
     for sl in eff.section_slots:
-        for sec_k, p_val in user_overrides.section_page_budgets.items():
-            if sl.slot_uid == sec_k or sl.slot_uid.startswith(f"{sec_k}_"):
-                sl.max_pages = float(p_val)
+        resolved_b = resolve_budget_for_section_or_slot(user_overrides.section_page_budgets, None, sl)
+        if resolved_b is not None:
+            sl.max_pages = float(resolved_b)
 
     return eff
 
@@ -443,6 +656,7 @@ class ConversionJobIR:
     slot_mapping: Dict[str, str] = field(default_factory=dict)
     output_files: Dict[str, str] = field(default_factory=dict)
     solver_telemetry: Dict[str, dict] = field(default_factory=dict)
+    page_budget_solution: Dict[str, object] = field(default_factory=dict)
 
 
 def compute_non_ws_sha256(raw_text: str) -> Tuple[str, int, str]:

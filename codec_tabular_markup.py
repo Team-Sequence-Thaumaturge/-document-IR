@@ -17,8 +17,9 @@ def lift_markdown_to_ir(md_path: str, target_width_hu: int = 46200) -> Dict[str,
         lines = f.read().splitlines()
 
     sections: Dict[str, SectionIR] = {}
-    cur_sec_id = "SEC_1"
+    cur_sec_id = "SEC_01"
     cur_heading = "Markdown Root"
+    cur_ord = 1
     cur_blocks: List[dict] = []
     table_buffer: List[List[str]] = []
 
@@ -87,6 +88,8 @@ def lift_markdown_to_ir(md_path: str, target_width_hu: int = 46200) -> Dict[str,
             blocks=cur_blocks,
             non_ws_char_count=n_c,
             text_sha256=sha,
+            ordinal_index=cur_ord,
+            section_role="BODY",
         )
         cur_blocks = []
 
@@ -126,11 +129,9 @@ def lift_markdown_to_ir(md_path: str, target_width_hu: int = 46200) -> Dict[str,
         if stripped.startswith("# "):
             flush_sec()
             cur_heading = stripped[2:].strip()
-            ord_idx = extract_ordinal_index(cur_heading)
-            if cur_heading.startswith(("Q", "q")) and ord_idx is not None:
-                cur_sec_id = f"Q{ord_idx}"
-            else:
-                cur_sec_id = f"SEC_{len(sections) + 1}"
+            sec_seq = len(sections) + 1
+            cur_sec_id = f"SEC_{sec_seq:02d}"
+            cur_ord = extract_ordinal_index(cur_heading) or sec_seq
             continue
         is_bold_heading = stripped.startswith("##")
         clean_txt = stripped.lstrip("#").strip() if is_bold_heading else stripped
@@ -235,11 +236,37 @@ def lift_csv_to_ir(csv_path: str, delimiter: str = ",", target_width_hu: int = 4
     }
     _, n_c, sha = extract_ir_non_ws_text([tbl_blk])
     return {
-        "TABULAR_MAIN": SectionIR(
-            section_uid="TABULAR_MAIN",
+        "SEC_01": SectionIR(
+            section_uid="SEC_01",
             heading_text=os.path.basename(csv_path),
             blocks=[tbl_blk],
             non_ws_char_count=n_c,
             text_sha256=sha,
+            ordinal_index=1,
+            section_role="BODY",
         )
     }
+
+
+def project_ir_to_csv(sections: Dict[str, SectionIR], out_csv_path: str, delimiter: str = ",") -> dict:
+    rows_out: List[List[str]] = []
+    for sec in sections.values():
+        for blk in sec.blocks:
+            if blk["type"] == "tbl":
+                rows_by_r: Dict[int, List[dict]] = {}
+                for c in blk["cells"]:
+                    rows_by_r.setdefault(c["row"], []).append(c)
+                for r_i in range(blk["n_rows"]):
+                    row_cells = sorted(rows_by_r.get(r_i, []), key=lambda x: x["col"])
+                    rows_out.append(
+                        [" ".join("".join(r["text"] for r in p["runs"]) for p in rc["paras"]) for rc in row_cells]
+                    )
+            elif blk["type"] == "p":
+                txt = "".join(r["text"] for r in blk["runs"]).strip()
+                if txt:
+                    rows_out.append([sec.section_uid, txt])
+    os.makedirs(os.path.dirname(os.path.abspath(out_csv_path)), exist_ok=True)
+    with open(out_csv_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f, delimiter=delimiter)
+        writer.writerows(rows_out)
+    return {"out_csv_path": out_csv_path, "bytes": os.path.getsize(out_csv_path), "rows": len(rows_out)}

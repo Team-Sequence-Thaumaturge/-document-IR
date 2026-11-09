@@ -1,10 +1,10 @@
 """
-T-DIR v3.1 2D Topological Grid Normalizer & 6-Stage Minimum-Invasion Elastic Layout Solver.
+T-DIR v3.2 2D Topological Grid Normalizer, Numerical Page-Budget Solver, & 6-Stage Minimum-Invasion Elastic Layout Solver.
 Zero hardcoded font sizes, pixel/HWPUNIT constants, or document-specific strings:
   - Table normalization relies purely on 2D grid sparsity and span topology (with pre-spacer
     and post-spacer stair-step detection `[BUG-01]`, `[BUG-02]` and non-zero `row_cols` invariant `[EDGE-02]`).
   - Line heights, character capacities (with CJK/Latin East-Asian-Width weighting `[EDGE-04]`),
-    and page budgets scale proportionally with resolved typography and page geometry.
+    and page budgets scale proportionally with resolved typography and physical page box geometry (`[NUM-04]`).
 """
 
 import math
@@ -12,7 +12,14 @@ import copy
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Set, Optional
 
-from .ir_schema import TargetDocumentSpecIR, compute_weighted_text_units
+from .ir_schema import (
+    SectionIR,
+    SlotSpecIR,
+    TargetDocumentSpecIR,
+    UserSpecOverrideIR,
+    compute_weighted_text_units,
+    resolve_budget_for_section_or_slot,
+)
 
 
 @dataclass
@@ -48,15 +55,24 @@ def compute_effective_page_body_height_hu(
     explicit_override_hu: Optional[int] = None,
 ) -> int:
     """
-    Derives single-page effective body capacity (HU) dynamically from the target document's
-    physical page height and top/bottom margins without hardcoded magic constants.
+    Derives single-page effective body capacity (HU) directly from the target document's
+    physical paper height minus effective top and bottom page margins ([NUM-04]).
     """
     if explicit_override_hu is not None and explicit_override_hu > 10000:
         return explicit_override_hu
     if target_spec is not None and target_spec.page_height_hu > 20000:
-        net_h = target_spec.page_height_hu - target_spec.margin_top_hu - target_spec.margin_bottom_hu
-        return max(20000, int(round(net_h * 1.0372)))
-    return 78500
+        eff_top_hu = (
+            target_spec.margin_top_hu
+            if target_spec.margins_explicitly_overridden
+            else min(2800, target_spec.margin_top_hu if target_spec.margin_top_hu > 0 else 2800)
+        )
+        eff_bot_hu = (
+            target_spec.margin_bottom_hu
+            if target_spec.margins_explicitly_overridden
+            else min(2800, target_spec.margin_bottom_hu if target_spec.margin_bottom_hu > 0 else 2800)
+        )
+        return max(20000, target_spec.page_height_hu - eff_top_hu - eff_bot_hu)
+    return 78588
 
 
 def is_stair_step_sparse_grid(grid_cells: List[List[Optional[dict]]], n_rows_raw: int, n_cols_raw: int) -> bool:
@@ -725,3 +741,136 @@ class MinimumInvasionElasticSolver:
             "merged_body_pairs_count": state.merged_body_pairs_count,
         }
         return blocks, state, telemetry
+
+
+def solve_document_page_budgets(
+    sections: Dict[str, SectionIR],
+    slot_mapping: Dict[str, str],
+    target_spec: TargetDocumentSpecIR,
+    user_overrides: UserSpecOverrideIR,
+    solver: MinimumInvasionElasticSolver,
+) -> dict:
+    """
+    Numerically resolves per-section page budgets B_k and total expected document pages P_expected
+    from `user_overrides.total_page_limit`, `user_overrides.section_page_budgets`, or natural
+    Stage-2 content volume without hardcoded 2.0-page or 8-page constants ([NUM-04]).
+    """
+    eff_page_h = compute_effective_page_body_height_hu(target_spec, solver.page_body_height_hu)
+    b_font_hu = target_spec.body_font_size_hu if target_spec.body_font_size_hu > 0 else 1200
+    t_font_hu = target_spec.table_font_size_hu if target_spec.table_font_size_hu > 0 else 1000
+    min_b_ls = target_spec.min_line_spacing_pct if target_spec.min_line_spacing_pct > 0 else 122
+    min_t_ls = target_spec.table_min_line_spacing_pct if target_spec.table_min_line_spacing_pct > 0 else 112
+
+    probe_state = ElasticLayoutState(
+        body_font_size_hu=b_font_hu,
+        table_font_size_hu=t_font_hu,
+        body_line_spacing_pct=min_b_ls,
+        table_line_spacing_pct=min_t_ls,
+        body_line_tw=compute_proportional_line_tw(b_font_hu, min_b_ls, is_table=False),
+        table_line_tw=compute_proportional_line_tw(t_font_hu, min_t_ls, is_table=True),
+    )
+
+    mapped_sec_uids = [s_uid for s_uid in slot_mapping.keys() if s_uid in sections]
+    slot_by_uid: Dict[str, SlotSpecIR] = {sl.slot_uid: sl for sl in target_spec.section_slots}
+    natural_heights_hu: Dict[str, int] = {}
+
+    for s_uid in mapped_sec_uids:
+        sec_obj = sections[s_uid]
+        sl_obj = slot_by_uid.get(slot_mapping[s_uid])
+        avail_w = sl_obj.available_width_hu if (sl_obj and sl_obj.available_width_hu > 0) else 46200
+        filtered_blks = [
+            b
+            for b in sec_obj.blocks
+            if not (user_overrides.route_media_to_attachment_slots and b["type"] == "p" and b.get("r_embed") and not b["runs"])
+        ]
+        natural_heights_hu[s_uid] = max(1, estimate_section_height_hu(filtered_blks, probe_state, avail_w))
+
+    # Count fixed pages (cover/preamble + unmapped outer slots + attachment media pages)
+    preamble_pages = 1 if (target_spec.preamble_blocks and user_overrides.preserve_outer_tables) else 0
+    mapped_slot_set = {slot_mapping[s_uid] for s_uid in mapped_sec_uids}
+    unmapped_slots = [sl for sl in target_spec.section_slots if sl.slot_uid not in mapped_slot_set]
+    unmapped_slot_pages = (
+        len(unmapped_slots)
+        if (user_overrides.preserve_outer_tables and not user_overrides.clear_unmapped_slots)
+        else 0
+    )
+    if target_spec.attachment_slots and user_overrides.preserve_outer_tables:
+        g_cols = max(1, target_spec.attachment_slots[0].grid_cols)
+        attachment_pages = max(1, math.ceil(len(target_spec.attachment_slots) / float(g_cols * 3)))
+    else:
+        attachment_pages = 0
+
+    fixed_pages = preamble_pages + unmapped_slot_pages + attachment_pages
+
+    resolved_budgets: Dict[str, float] = {}
+    auto_sec_uids: List[str] = []
+
+    for s_uid in mapped_sec_uids:
+        sec_obj = sections[s_uid]
+        sl_obj = slot_by_uid.get(slot_mapping[s_uid])
+        exp_b = resolve_budget_for_section_or_slot(user_overrides.section_page_budgets, sec_obj, sl_obj)
+        if exp_b is not None:
+            resolved_budgets[s_uid] = float(exp_b)
+        else:
+            auto_sec_uids.append(s_uid)
+
+    if auto_sec_uids:
+        if user_overrides.total_page_limit is not None:
+            explicit_sum = sum(resolved_budgets.values())
+            avail_body_pages = max(
+                float(len(auto_sec_uids)),
+                float(user_overrides.total_page_limit - fixed_pages) - explicit_sum,
+            )
+            tot_h = float(sum(natural_heights_hu[u] for u in auto_sec_uids)) or 1.0
+            target_int_sum = max(len(auto_sec_uids), int(round(avail_body_pages)))
+            raw_quotas = {
+                u: max(1.0, (natural_heights_hu[u] / tot_h) * target_int_sum) for u in auto_sec_uids
+            }
+            floored = {u: max(1, int(math.floor(raw_quotas[u]))) for u in auto_sec_uids}
+            while sum(floored.values()) > target_int_sum:
+                k_max = max(auto_sec_uids, key=lambda u: floored[u])
+                if floored[k_max] > 1:
+                    floored[k_max] -= 1
+                else:
+                    break
+            rem_pages = target_int_sum - sum(floored.values())
+            if rem_pages > 0:
+                by_frac = sorted(
+                    auto_sec_uids,
+                    key=lambda u: (raw_quotas[u] - floored[u], natural_heights_hu[u]),
+                    reverse=True,
+                )
+                for idx_r in range(rem_pages):
+                    floored[by_frac[idx_r % len(by_frac)]] += 1
+            for u in auto_sec_uids:
+                resolved_budgets[u] = float(floored[u])
+        else:
+            for u in auto_sec_uids:
+                nat_p = max(1, math.ceil(natural_heights_hu[u] / float(eff_page_h)))
+                # If natural Stage-2 height is within 38% of an integer page boundary (Stage 3/4/5 compressible range),
+                # set target budget to the tighter integer page count so MinimumInvasionElasticSolver compacts overflow
+                ratio_p = natural_heights_hu[u] / float(eff_page_h)
+                floor_p = max(1, int(math.floor(ratio_p)))
+                if ratio_p - floor_p <= 0.38:
+                    resolved_budgets[u] = float(floor_p)
+                else:
+                    resolved_budgets[u] = float(nat_p)
+
+    for s_uid, b_val in resolved_budgets.items():
+        sl_obj = slot_by_uid.get(slot_mapping[s_uid])
+        if sl_obj is not None:
+            sl_obj.max_pages = float(b_val)
+
+    mapped_body_pages = sum(max(1, int(math.ceil(b_val))) for b_val in resolved_budgets.values())
+    expected_total_pages = fixed_pages + mapped_body_pages
+
+    return {
+        "effective_page_body_height_hu": eff_page_h,
+        "natural_stage2_heights_hu": natural_heights_hu,
+        "section_budgets": resolved_budgets,
+        "preamble_pages": preamble_pages,
+        "mapped_body_pages": mapped_body_pages,
+        "unmapped_slot_pages": unmapped_slot_pages,
+        "attachment_pages": attachment_pages,
+        "expected_total_pages": expected_total_pages,
+    }

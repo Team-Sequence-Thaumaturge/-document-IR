@@ -290,6 +290,7 @@ def scan_hwp_template_slots(template_path: str) -> TargetDocumentSpecIR:
 
     n_recs = len(sec_recs)
     skipped_ranges: List[Tuple[int, int]] = []
+    cand_sec_tables: List[dict] = []
     first_sec_table_idx: Optional[int] = None
     last_sec_table_end_idx: Optional[int] = None
     attachment_table_idx: Optional[int] = None
@@ -317,11 +318,33 @@ def scan_hwp_template_slots(template_path: str) -> TargetDocumentSpecIR:
                         cells_info.append((j, row_a, col_a, r_span, c_span, w_cell, h_cell, mar_4, cell_txt, cs_id_cell))
                     j += 1
 
-                # Case B: 6x2 Photo Attachment Table ('붙임')
-                if n_rows == 6 and n_cols == 2 and len(cells_info) >= 4:
+                # Case B: Generalized 2R x C Periodic Alternating Media Grid Table ([NUM-03])
+                is_periodic_media_grid = False
+                if n_rows >= 2 and n_rows % 2 == 0 and 1 <= n_cols <= 4 and len(cells_info) >= n_rows * n_cols:
+                    n_pairs_cand = n_rows // 2
+                    pair_checks_ok = True
+                    for pair_r in range(n_pairs_cand):
+                        for col_c in range(n_cols):
+                            img_c = next(
+                                (c for c in cells_info if c[1] == pair_r * 2 and c[2] == col_c and c[4] == 1),
+                                None,
+                            )
+                            cap_c = next(
+                                (c for c in cells_info if c[1] == pair_r * 2 + 1 and c[2] == col_c and c[4] == 1),
+                                None,
+                            )
+                            if not img_c or not cap_c or img_c[6] < 3000 or cap_c[6] <= 0 or img_c[6] < cap_c[6] * 2:
+                                pair_checks_ok = False
+                                break
+                        if not pair_checks_ok:
+                            break
+                    is_periodic_media_grid = pair_checks_ok
+
+                if is_periodic_media_grid:
                     attachment_table_idx = ctrl_idx
-                    for pair_r in range(3):
-                        for col_c in range(2):
+                    n_pairs_grid = n_rows // 2
+                    for pair_r in range(n_pairs_grid):
+                        for col_c in range(n_cols):
                             img_c = next((c for c in cells_info if c[1] == pair_r * 2 and c[2] == col_c), None)
                             cap_c = next((c for c in cells_info if c[1] == pair_r * 2 + 1 and c[2] == col_c), None)
                             if img_c and cap_c:
@@ -332,26 +355,28 @@ def scan_hwp_template_slots(template_path: str) -> TargetDocumentSpecIR:
                                 att_idx = len(spec.attachment_slots) + 1
                                 spec.attachment_slots.append(
                                     SlotSpecIR(
-                                        slot_uid=f"ATTACH_{att_idx}",
+                                        slot_uid=f"MEDIA_{att_idx:02d}",
                                         slot_role="ATTACHMENT_MEDIA_SLOT",
                                         discovered_title_text=cap_c[8],
                                         outer_tbl_record_idx=ctrl_idx,
                                         body_cell_record_idx=img_c[0],
                                         caption_cell_record_idx=cap_c[0],
-                                        outer_width_hu=w_outer if w_outer > 0 else img_c[5] * 2,
+                                        outer_width_hu=w_outer if w_outer > 0 else img_c[5] * n_cols,
                                         outer_height_hu=h_outer,
-                                        col_widths_hu=[img_c[5], img_c[5]],
+                                        col_widths_hu=[img_c[5]] * n_cols,
                                         header_height_hu=cap_c[6],
                                         cell_margins_hu=img_c[7],
                                         available_width_hu=img_c[5],
                                         available_height_hu=img_c[6],
                                         max_pages=1.0,
+                                        ordinal_index=att_idx,
+                                        grid_cols=n_cols,
                                     )
                                 )
                     i = j
                     continue
 
-                # Case A: Standard 2x2 Section Outer Table OR Generalized Form Container Table ([GEN-01])
+                # Case A: Generalized Section Container Table ([GEN-01], [NUM-01], [NUM-02])
                 title_cell = next((c for c in cells_info if c[1] == 0 and c[2] == 0), None)
                 sub_cell = next((c for c in cells_info if c[1] == 0 and c[2] >= 1), None)
                 body_cell = next(
@@ -371,57 +396,95 @@ def scan_hwp_template_slots(template_path: str) -> TargetDocumentSpecIR:
                 ):
                     t_str = title_cell[8]
                     sub_str = sub_cell[8] if sub_cell else ""
-                    if "작성 요령" in t_str or "삭제 후 제출" in sub_str:
-                        skipped_ranges.append((max(0, ctrl_idx - 3), j))
-                        i = j
-                        continue
-
-                    if first_sec_table_idx is None:
-                        first_sec_table_idx = ctrl_idx
-                        b_cs_id = body_cell[9] if body_cell[9] is not None else (sub_cell[9] if sub_cell else None)
-                        if b_cs_id is not None and 0 <= b_cs_id < len(char_shapes):
-                            f_id_b, h_hu_b, _, _ = char_shapes[b_cs_id]
-                            if 0 <= f_id_b < len(face_names) and face_names[f_id_b]:
-                                spec.body_font_family = face_names[f_id_b]
-                                spec.table_font_family = face_names[f_id_b]
-                            if 800 <= h_hu_b <= 1500:
-                                spec.body_font_size_hu = h_hu_b
-
-                    last_sec_table_end_idx = j
-                    ord_idx = extract_ordinal_index(t_str)
-                    if ord_idx is not None:
-                        slot_uid = f"Q{ord_idx}_BODY"
-                    else:
-                        slot_uid = f"Q{len(spec.section_slots) + 1}_BODY"
-
-                    col_w_list = (
-                        [title_cell[5], sub_cell[5]]
-                        if sub_cell
-                        else [title_cell[5], max(1000, body_cell[5] - title_cell[5])]
-                    )
-                    b_mar = body_cell[7]
-                    pad_x = max(1400, (b_mar[0] + b_mar[1]) * 2)
-                    spec.section_slots.append(
-                        SlotSpecIR(
-                            slot_uid=slot_uid,
-                            slot_role="SECTION_BODY_SLOT",
-                            discovered_title_text=t_str,
-                            discovered_subtitle_text=sub_str,
-                            outer_tbl_record_idx=ctrl_idx,
-                            body_cell_record_idx=body_cell[0],
-                            outer_width_hu=w_outer if w_outer > 0 else sum(col_w_list),
-                            outer_height_hu=h_outer if h_outer > 0 else (title_cell[6] + body_cell[6]),
-                            col_widths_hu=col_w_list,
-                            header_height_hu=title_cell[6],
-                            cell_margins_hu=b_mar,
-                            available_width_hu=max(10000, body_cell[5] - pad_x),
-                            available_height_hu=body_cell[6],
-                            max_pages=2.0,
-                        )
+                    ord_idx = extract_ordinal_index(t_str) or extract_ordinal_index(sub_str)
+                    cand_sec_tables.append(
+                        {
+                            "ctrl_idx": ctrl_idx,
+                            "end_idx": j,
+                            "w_outer": w_outer,
+                            "h_outer": h_outer,
+                            "title_cell": title_cell,
+                            "sub_cell": sub_cell,
+                            "body_cell": body_cell,
+                            "t_str": t_str,
+                            "sub_str": sub_str,
+                            "ord_idx": ord_idx,
+                        }
                     )
                 i = j
                 continue
         i += 1
+
+    page_h_ref = spec.page_height_hu if spec.page_height_hu > 20000 else 84188
+    first_ord_one_pos = next((idx_c for idx_c, c in enumerate(cand_sec_tables) if c["ord_idx"] == 1), None)
+
+    for idx_c, c in enumerate(cand_sec_tables):
+        ctrl_idx = c["ctrl_idx"]
+        j_end = c["end_idx"]
+        ord_idx = c["ord_idx"]
+        title_cell = c["title_cell"]
+        sub_cell = c["sub_cell"]
+        body_cell = c["body_cell"]
+        t_str = c["t_str"]
+        sub_str = c["sub_str"]
+        w_outer = c["w_outer"]
+        h_outer = c["h_outer"]
+
+        # Topological ordinal prefix & geometric filter:
+        # 1) Any unnumbered container preceding the first ordinal-1 section slot table is a pre-section notice box
+        # 2) In completely unnumbered templates, a leading small container (< 35% page height) is a notice box
+        is_pre_section_notice = (
+            (first_ord_one_pos is not None and idx_c < first_ord_one_pos and ord_idx is None)
+            or (first_ord_one_pos is None and first_sec_table_idx is None and ord_idx is None and body_cell[6] < int(page_h_ref * 0.35))
+        )
+        if is_pre_section_notice:
+            skipped_ranges.append((max(0, ctrl_idx - 3), j_end))
+            continue
+
+        if first_sec_table_idx is None:
+            first_sec_table_idx = ctrl_idx
+            b_cs_id = body_cell[9] if body_cell[9] is not None else (sub_cell[9] if sub_cell else None)
+            if b_cs_id is not None and 0 <= b_cs_id < len(char_shapes):
+                f_id_b, h_hu_b, _, _ = char_shapes[b_cs_id]
+                if 0 <= f_id_b < len(face_names) and face_names[f_id_b]:
+                    spec.body_font_family = face_names[f_id_b]
+                    spec.table_font_family = face_names[f_id_b]
+                if 800 <= h_hu_b <= 1500:
+                    spec.body_font_size_hu = h_hu_b
+
+        last_sec_table_end_idx = j_end
+        slot_seq = len(spec.section_slots) + 1
+        eff_ord = ord_idx if ord_idx is not None else slot_seq
+        slot_uid = f"SLOT_{slot_seq:02d}"
+
+        col_w_list = (
+            [title_cell[5], sub_cell[5]]
+            if sub_cell
+            else [title_cell[5], max(1000, body_cell[5] - title_cell[5])]
+        )
+        b_mar = body_cell[7]
+        pad_x = max(1400, (b_mar[0] + b_mar[1]) * 2)
+        net_page_h = max(20000.0, float(page_h_ref - spec.margin_top_hu - spec.margin_bottom_hu))
+        est_slot_pages = max(1.0, float(round((title_cell[6] + body_cell[6]) / net_page_h)))
+        spec.section_slots.append(
+            SlotSpecIR(
+                slot_uid=slot_uid,
+                slot_role="SECTION_BODY_SLOT",
+                discovered_title_text=t_str,
+                discovered_subtitle_text=sub_str,
+                outer_tbl_record_idx=ctrl_idx,
+                body_cell_record_idx=body_cell[0],
+                outer_width_hu=w_outer if w_outer > 0 else sum(col_w_list),
+                outer_height_hu=h_outer if h_outer > 0 else (title_cell[6] + body_cell[6]),
+                col_widths_hu=col_w_list,
+                header_height_hu=title_cell[6],
+                cell_margins_hu=b_mar,
+                available_width_hu=max(10000, body_cell[5] - pad_x),
+                available_height_hu=body_cell[6],
+                max_pages=est_slot_pages,
+                ordinal_index=eff_ord,
+            )
+        )
 
     # Extract preamble text blocks before first_sec_table_idx (excluding skipped instruction ranges)
     if first_sec_table_idx is not None:

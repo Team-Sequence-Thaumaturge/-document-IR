@@ -1,11 +1,11 @@
 # T-DIR (`document-IR`) — Topological Document Intermediate Representation MCP Server
 
-**[last patch : 2026-11-08 20:15:00 UTC]**
+**[last patch : 2026-11-09 01:08:00 UTC]**
 
 🌐 **[English (./README.md)](./README.md)** | 🇰🇷 **[한국어 (./README_KO.md)](./README_KO.md)**
 
 > [!WARNING]
-> **Work in Progress (Experimental Beta — `v3.1.0-beta`)**
+> **Work in Progress (Experimental Beta — `v3.2.0-beta`)**
 > This repository is currently under active development and architectural verification. **It is NOT yet feature-complete or production-hardened.**
 > - Several format lifters and projectors (such as direct `<hp:pic>` binary stream embedding inside standalone `.hwpx` packages, full `.xlsx` spreadsheet cell-style lifting, and multi-engine equation AST conversion) are still incomplete.
 > - Internal data structures (`SectionIR`, `SlotSpecIR`, `SourceDocumentSpecIR`, `TargetDocumentSpecIR`, `UserSpecOverrideIR`, `ElasticLayoutState`) and MCP tool parameters may undergo breaking changes as beta regression testing progresses.
@@ -19,22 +19,22 @@
 ### Why Traditional 1:1 Document Converters Fail
 1. **Box-Model & Coordinate Unit Discrepancies**: Direct translation between `HWPUNIT` ($1\text{ pt} = 100\text{ HU}$), `Twips` ($1\text{ pt} = 20\text{ dxa}$), `EMU` ($1\text{ HU} = 127\text{ EMU}$), and CSS pixels fails when nested tables have asymmetric cell margins, merged spans (`gridSpan` / `vMerge`), or empty decorative spacer columns.
 2. **Line-Grid Snap Inflation (`snapToGrid`)**: Fonts with large vertical bounding boxes trigger line-grid snapping in MS Word (`w:lineRule="auto"`), inflating body text height per line and causing content to overflow fixed-page form templates.
-3. **Rigid Form Template Boundaries**: Official Korean business plan and grant templates (`.hwp`) wrap each section inside fixed `2x2` outer layout tables and place media attachments in bottom `6x2` grid slots (`붙임`). Naive copy-pasting breaks outer table borders, duplicates headers across pages, or truncates overflowing text.
+3. **Rigid Form Template Boundaries**: Official Korean business plan and grant templates (`.hwp`) wrap each section inside outer layout tables (`SLOT 01..M`) and place media attachments in bottom `2R x C` periodic grid slots (`MEDIA 01..P`). Naive copy-pasting breaks outer table borders, duplicates headers across pages, or truncates overflowing text.
 4. **LLM Context & Token Overhead**: Feeding tens of thousands of lines of raw OOXML (`word/document`) or OWPML (`Contents/section0`) XML into an LLM wastes context window tokens and risks accidental text hallucination or omission.
 
 ---
 
-## 2. Core Architecture & Zero-Hardcoding Specification Resolution
+## 2. Core Architecture & Zero-Hardcoding Numerical Resolution (`v3.2.0-beta`)
 
-T-DIR separates **content semantics**, **dynamic specification resolution**, **2D grid topology**, and **physical metric projection** into strictly isolated layers with **zero hardcoded font names, pixel/HWPUNIT constants, or document-specific strings**:
+T-DIR separates **content semantics**, **dynamic specification resolution**, **unsupervised heading/slot topology**, **numerical page-budget allocation**, and **physical metric projection** into strictly isolated layers with **zero hardcoded font names, pixel/HWPUNIT constants, section IDs (`Q1..Q4`), page counts (`8 pages` / `2 pages`), or document-specific strings**:
 
 ```mermaid
 flowchart LR
-    A["Source & Target Files<br/>(.docx, .hwp, .hwpx, .md, .csv)"] --> B["Layer 1: Dynamic Spec & Slot Scanner<br/>(DocInfo / Section0 / OOXML Styles)"]
-    U["User MCP Spec Overrides<br/>(UserSpecOverrideIR)"] --> C["Priority Spec Resolver<br/>(User > Target > Source)"]
+    A["Source & Target Files<br/>(.docx, .hwp, .hwpx, .md, .csv)"] --> B["Layer 1: Unsupervised Heading Spectrum<br/>& Generalized Slot/Media Grid Scanner"]
+    U["User MCP Spec Overrides<br/>(UserSpecOverrideIR)"] --> C["Priority Spec & Numerical<br/>Page-Budget Resolver"]
     B --> C
     C --> D["Layer 2: 2D Grid Normalizer &<br/>6-Stage Elastic Solver (Early-Stop)"]
-    D --> E["Layer 3: Deterministic Projectors<br/>(.hwp CFB, .hwpx, .docx, .md)"]
+    D --> E["Layer 3: Deterministic Projectors<br/>(.hwp CFB, .hwpx, .docx, .md, .csv)"]
     E --> F["Cryptographic Verifier<br/>(Non-Whitespace SHA-256 + PDF Pages)"]
 ```
 
@@ -43,27 +43,22 @@ Instead of hardcoding fonts, font sizes, or page dimensions, T-DIR extracts phys
 
 $$\text{EffectiveSpec} = \text{Priority 1 }(\text{UserSpecOverrideIR}) \succ \text{Priority 2 }(\text{TargetDocumentSpecIR}) \succ \text{Priority 3 }(\text{SourceDocumentSpecIR})$$
 
-1. **Priority 1 — `UserSpecOverrideIR` (Explicit User MCP Specification)**: Explicit formatting, typography (body font family, table font family, body font size in points, table font size in points), line spacing percentage bounds, page geometry (page width, height, and margins in millimeters), per-section page budgets, outer table preservation policy, micro-typography scaling toggle, and attachment captions passed by the user or agent via MCP tool calls.
+1. **Priority 1 — `UserSpecOverrideIR` (Explicit User MCP Specification)**: Explicit formatting, typography (body font family, table font family, body font size in points, table font size in points), line spacing percentage bounds, page geometry (page width, height, and margins in millimeters), total document page limit, per-section page budgets, outer table preservation policy, micro-typography scaling toggle, and attachment captions passed by the user or agent via MCP tool calls.
 2. **Priority 2 — `TargetDocumentSpecIR` ([`./codec_hwp_v5.py`](./codec_hwp_v5.py))**: Dynamically extracted from the target template's binary streams:
    - `DocInfo` stream: `Tag 19` (UTF-16LE font families), `Tag 21` (character shape font sizes in `HU` and RGB colors), and `Tag 25` (paragraph shape line spacing percentages).
-   - `Section0..SectionN` streams: `Tag 73` (page definition width, height, and margins in `HU`), preamble/cover blocks, generalized `NxM` section container tables (outer width, column widths, discovered title text, discovered subtitle text, and available inner width in `HU`), and `6x2` attachment slot geometries (`ATTACH 1..6`).
+   - `Section0..SectionN` streams: `Tag 73` (page definition width, height, and margins in `HU`), preamble/cover blocks, generalized `NxM` section container tables (`SLOT 01..M` with ordinal index), and generalized `2R x C` periodic alternating media grids (`MEDIA 01..P`).
 3. **Priority 3 — `SourceDocumentSpecIR` ([`./codec_ooxml_owpml.py`](./codec_ooxml_owpml.py))**: Dynamically extracted from the source document (`word/styles` and `word/document` `sectPr` in `.docx`, or `DocInfo`/`Section0` in `.hwp`), providing fallback prose/table font families and sizes when the target template's body cells are empty placeholders.
 
-### 2.2. Pure 2D Topological Grid Classifiers ([`./elastic_solver.py`](./elastic_solver.py))
-All table and paragraph structural classifications operate purely on 2D matrix geometry and punctuation topology without matching any document-specific text:
-- **Stair-Step Sparse Chart Detector**: Detects 2D grids where a single full-width axis row divides upper/lower rows containing sparse single non-empty cells (`1..2` active columns per row) — both before and after empty spacer column removal — and collapses them into a dense 4-row chronological table.
-- **Vertical Step-Arrow Detector**: Detects single-column tables (odd row count $\ge 3$) where every odd-indexed row (`r = 1, 3, ...`) is a short connector/arrow indicator ($\le 25$ chars) and folds the connector inline into the preceding step row.
-- **Multi-Column Spacer Card Collapser**: Automatically collapses multi-column tables where every non-empty row contains at most 1 non-empty cell into a clean full-width `1`-column card stack.
-- **Standalone Subheading Classifier**: Identifies standalone short subheadings ($\le 40$ chars, bold or bracket/bullet-prefixed, not ending with sentence terminal punctuation) for Stage 3 inline lead-in merging.
+### 2.2. Unsupervised Heading Spectrum & Generalized Slot Topology (`[NUM-01]` ~ `[NUM-03]`)
+- **Unsupervised Top-Level Section Detector (`[NUM-01]`)**: Computes the statistical mode body font size $S_{\text{mode}}$ across paragraphs and detects top-level sections (`SEC 01..K`, `PREAMBLE`, `REFERENCES`) via OOXML outline levels (`outlineLvl == 0` / `Heading1`), structural chapter/ordinal prefixes (`제1장`, `I.`, `Ⅰ.`, `Chapter 1`, `Q1.`), or typographic font-size jumps ($\ge S_{\text{mode}} + 150\text{ HU}$ bold) without hardcoded title strings.
+- **Topological Ordinal Prefix Notice Filter (`[NUM-01]`)**: Automatically filters out unnumbered pre-section instruction/notice boxes preceding the first ordinal-1 section slot table (`SlotSpecIR`) without matching hardcoded strings like `"작성 요령"`.
+- **Universal Section Selector Matcher (`[NUM-02]`)**: `UserSpecOverrideIR` selectors accept generic section IDs (`SEC 01`), target slot IDs (`SLOT 01`), ordinal indices (`1`, `"2"`), or heading title substrings (`"Q1"`, `"제1장"`, `"Executive Summary"`), with zero default excluded sections.
+- **Generalized $2R \times C$ Periodic Media Grid Scanner (`[NUM-03]`)**: Detects any even-row $2R \times C$ table ($R \ge 1, 1 \le C \le 4$) where even rows are tall image cells ($H_{2r} \ge 3000\text{ HU}$) and odd rows are compact caption cells ($H_{2r} \ge 2 \cdot H_{2r+1}$), emitting `MEDIA 01..P` (`SlotSpecIR`).
 
-### 2.3. 6-Stage Minimum-Invasion Elastic Layout Solver (`MinimumInvasionElasticSolver`)
-To fit dense source sections into strict page budgets **without over-squishing paragraphs**, `MinimumInvasionElasticSolver` computes East-Asian-Width weighted text units (`CJK` full-width vs. Latin/ASCII half-width) and scales line heights proportionally with the resolved body and table font sizes, executing a progressive 6-stage loop and **stopping immediately (`Early-Stop`)** as soon as the estimated height fits within the target page budget:
-- **Stage 1 (Spacers Only)**: Removes empty spacer paragraphs and empty table rows/columns, enforces HWP `Tag 77` non-zero row cell count invariants, and disables document line-grid snapping (`snapToGrid = False`).
-- **Stage 2 (Spacing Interpolation Only)**: Interpolates body line spacing and table line spacing between the resolved maximum and minimum percentage bounds while keeping **100% of original paragraph and table cell line breaks intact**.
-- **Stage 3 (Subheading Inline Early-Stop)**: Converts standalone short subheadings into bold inline lead-ins (`[Bold Subheading]  [Body Paragraph]`) using whitespace-only joining (`"  "`) so non-whitespace character hashes remain identical.
-- **Stage 4 (Partial Cell Merge Early-Stop)**: Sorts multi-paragraph table cells by shortest combined character length and merges one adjacent pair at a time, checking the height budget after **every single merge**.
-- **Stage 5 (Minimal Body Continuation Early-Stop)**: Only if still over budget after Stage 4, merges the shortest adjacent body continuation paragraphs one by one until the page budget is met.
-- **Stage 6 (Optional Micro-Typography Font Scaling)**: When explicitly enabled via `UserSpecOverrideIR`, applies a bounded `-50 HU` (`-0.5pt`) micro-typography step if Stage 5 still exceeds the page budget.
+### 2.3. Numerical Page-Budget Allocation Solver & 6-Stage Elastic Solver (`[NUM-04]`)
+- **Physical Box-Model Page Capacity**: Computes effective page body height directly from resolved `TargetDocumentSpecIR` page geometry ($84,188\text{ HU} - 2,800\text{ HU} - 2,800\text{ HU} = 78,588\text{ HU}$ on standard A4) without empirical magic multipliers.
+- **Autonomous Page-Budget Solver ([`./elastic_solver.py`](./elastic_solver.py))**: Numerically resolves per-section page budgets $B_k$ and expected total document pages ($P_{\text{expected}} = P_{\text{preamble}} + P_{\text{body}} + P_{\text{unmapped}} + P_{\text{media}}$) from the total page limit, explicit section budgets, or natural Stage-2 content heights using largest-remainder proportional allocation.
+- **6-Stage Minimum-Invasion Elastic Layout Solver (`MinimumInvasionElasticSolver`)**: Executes a progressive 6-stage loop (**Stage 1** spacers $\to$ **Stage 2** line-spacing interpolation $\to$ **Stage 3** subheading inline lead-in $\to$ **Stage 4** shortest table cell pair merge $\to$ **Stage 5** shortest body continuation merge $\to$ **Stage 6** optional micro-typography scaling) and stops immediately (`Early-Stop`) once the resolved budget $B_k$ is satisfied.
 
 ---
 
@@ -71,15 +66,15 @@ To fit dense source sections into strict page budgets **without over-squishing p
 
 | Module Path | Description |
 | :--- | :--- |
-| [`./__init__.py`](./__init__.py) | Package initialization and exported classes (`TdirBetaMcpServer`, `MinimumInvasionElasticSolver`, `SourceDocumentSpecIR`, `TargetDocumentSpecIR`, `UserSpecOverrideIR`). |
-| [`./ir_schema.py`](./ir_schema.py) | T-DIR v3.1 data structures (`TextRunIR`, `ParagraphIR`, `TableCellIR`, `TableGridIR`, `MediaObjectIR`, `SectionIR`, `SlotSpecIR`, `SourceDocumentSpecIR`, `TargetDocumentSpecIR`, `UserSpecOverrideIR`, `ConversionJobIR`), dynamic specification priority resolver, magic-byte image detector, CJK/Latin width estimator, and cryptographic non-whitespace `SHA-256` verifier. |
-| [`./cfb_ole2.py`](./cfb_ole2.py) | Pure-Python MS-CFB (`CFBArchive` OLE2 Compound File Binary v3) reader and writer supporting 512B standard sectors, 64B mini-streams, `DIFAT` sector chains (`> 6.8 MB`), exact fixed-point FAT allocation, automatic `BinData` storage creation, and balanced Red-Black directory trees. |
-| [`./elastic_solver.py`](./elastic_solver.py) | Pure topological 2D grid normalizers and `MinimumInvasionElasticSolver` 6-stage Early-Stop layout engine (`ElasticLayoutState`). |
-| [`./codec_hwp_v5.py`](./codec_hwp_v5.py) | HWP v5.0 binary record parser (compressed & uncompressed streams, multi-section `Section0..SectionN`), `DocInfo` dynamic typography extractor, UTF-16LE surrogate-pair safe `WCHAR` accounting, dynamic font face registrar, `Section0` template slot scanner, lifter, and binary projector. |
-| [`./codec_ooxml_owpml.py`](./codec_ooxml_owpml.py) | OOXML (`.docx`) style/page scanner, `<w:sdt>` content control unwrapper, recursive nested table extractor, standalone `.docx` package synthesizer, and `TargetDocumentSpecIR`-driven `.docx` / `.hwpx` projectors. |
-| [`./codec_tabular_markup.py`](./codec_tabular_markup.py) | Markdown (`.md` with code-fence state machine and escaped-pipe table parser) and Tabular (`.csv`, `.tsv`) lifters and projectors. |
-| [`./mcp_server.py`](./mcp_server.py) | Standalone JSON-RPC 2.0 stdio MCP server (`TdirBetaMcpServer` / `tdir-document-beta`) exposing 5 tools, multi-source section deduplication, similarity-based slot matching, and the `UserSpecOverrideIR` JSON schema. |
-| [`./test_regression_suite.py`](./test_regression_suite.py) | End-to-end regression suite verifying dynamic typography/slot probing, `UserSpecOverrideIR` priority overrides, Early-Stop solving, multi-format projection, `SHA-256` text immutability, 8-page PDF boundary compliance, and `v3.1.0-beta` edge-case checks. |
+| [`./__init__.py`](./__init__.py) | Package initialization (`v3.2.0-beta`) and exported classes (`TdirBetaMcpServer`, `MinimumInvasionElasticSolver`, `SourceDocumentSpecIR`, `TargetDocumentSpecIR`, `UserSpecOverrideIR`). |
+| [`./ir_schema.py`](./ir_schema.py) | T-DIR v3.2 data structures (`TextRunIR`, `ParagraphIR`, `TableCellIR`, `TableGridIR`, `MediaObjectIR`, `SectionIR`, `SlotSpecIR`, `SourceDocumentSpecIR`, `TargetDocumentSpecIR`, `UserSpecOverrideIR`, `ConversionJobIR`), unsupervised heading spectrum detector, universal selector matcher, magic-byte image detector, CJK/Latin width estimator, and non-whitespace `SHA-256` verifier. |
+| [`./cfb_ole2.py`](./cfb_ole2.py) | Pure-Python MS-CFB (`CFBArchive` OLE2 Compound File Binary v3) reader and writer supporting 512B standard sectors, 64B mini-streams, `DIFAT` sector chains, fixed-point FAT allocation, automatic `BinData` storage creation, and balanced Red-Black directory trees. |
+| [`./elastic_solver.py`](./elastic_solver.py) | Pure topological 2D grid normalizers, numerical page-budget allocator, and `MinimumInvasionElasticSolver` 6-stage Early-Stop layout engine (`ElasticLayoutState`). |
+| [`./codec_hwp_v5.py`](./codec_hwp_v5.py) | HWP v5.0 binary record parser (compressed & uncompressed streams, multi-section `Section0..SectionN`), `DocInfo` dynamic typography extractor, UTF-16LE surrogate-pair safe `WCHAR` accounting, generalized `SLOT 01..M` and `2R x C` `MEDIA 01..P` scanner, lifter, and binary projector. |
+| [`./codec_ooxml_owpml.py`](./codec_ooxml_owpml.py) | OOXML (`.docx`) style/page scanner, unsupervised heading spectrum lifter, `<w:sdt>` content control unwrapper, recursive nested table extractor, standalone `.docx` package synthesizer, and `TargetDocumentSpecIR`-driven `.docx` / `.hwpx` projectors. |
+| [`./codec_tabular_markup.py`](./codec_tabular_markup.py) | Markdown (`.md` with code-fence state machine and escaped-pipe table parser) and Tabular (`.csv`, `.tsv`) bidirectional lifters and projectors. |
+| [`./mcp_server.py`](./mcp_server.py) | Standalone JSON-RPC 2.0 stdio MCP server (`TdirBetaMcpServer` / `tdir-document-beta`) exposing 5 tools, universal selector resolution, numerical page-budget preview, and multi-format conversion/verification. |
+| [`./test_regression_suite.py`](./test_regression_suite.py) | **8-Cohort Parametric Regression Experiment Suite (`EXP-01` ~ `EXP-08`)** validating diverse document hierarchies, numerical page-budget sweeps, metric spaces, 2D table topologies, generalized template topologies, cross-format round-trips, Unicode/DIFAT stress, and multi-source agent loops. |
 
 ---
 
@@ -91,14 +86,14 @@ The server ([`./mcp_server.py`](./mcp_server.py)) communicates over standard JSO
 # 1. Probe source documents and target template typography, page geometry, and slots dynamically
 tdir_probe_files(source_paths: list[str], target_path: str) -> dict
 
-# 2. Resolve effective spec (UserSpecOverrideIR > TargetDocumentSpecIR > SourceDocumentSpecIR) and preview Elastic Solver
+# 2. Resolve effective spec, numerical page budgets, and preview 6-stage Elastic Solver
 tdir_build_mapping_plan(
     job_id: str,
     user_spec_overrides: dict | None = None,
     user_constraints: dict | None = None,
 ) -> dict
 
-# 3. Execute deterministic projection into ["hwp", "hwpx", "docx", "md"]
+# 3. Execute deterministic projection into ["hwp", "hwpx", "docx", "md", "csv"]
 tdir_execute_conversion(
     job_id: str,
     output_prefix: str,
@@ -108,7 +103,7 @@ tdir_execute_conversion(
     user_spec_overrides: dict | None = None,
 ) -> dict
 
-# 4. Verify 100.00% non-whitespace SHA-256 text immutability and rendered PDF page count
+# 4. Verify 100.00% non-whitespace SHA-256 text immutability and rendered PDF page budget compliance
 tdir_verify_fidelity_and_layout(job_id: str, export_pdf: bool = True) -> dict
 
 # 5. Pinpoint adjustment of paragraph merge lock or table column widths with immediate solver preview refresh
@@ -122,7 +117,7 @@ tdir_adjust_block_layout(
 ```
 
 ### Supported `UserSpecOverrideIR` Fields
-When calling Tool 2 or Tool 3, users or agents can pass the override dictionary to explicitly override any aspect of the target specification:
+When calling Tool 2 or Tool 3, users or agents can pass the override dictionary to explicitly control typography, geometry, or numerical page budgets:
 
 ```json
 {
@@ -137,8 +132,9 @@ When calling Tool 2 or Tool 3, users or agents can pass the override dictionary 
   "page_width_mm": 210.0,
   "page_height_mm": 297.0,
   "margins_mm": {"top": 15.0, "bottom": 15.0, "left": 20.0, "right": 20.0},
-  "section_page_budgets": {"Q1": 2.0, "Q2": 2.0},
-  "exclude_sections": ["PREAMBLE", "Q3", "Q4", "REFERENCES"],
+  "total_page_limit": 8,
+  "section_page_budgets": {"SEC_01": 2.0, "SEC_02": 2.0},
+  "exclude_sections": ["SEC_03"],
   "preserve_outer_tables": true,
   "route_media_to_attachment_slots": true,
   "max_attachment_images": 3,
@@ -177,15 +173,19 @@ Add `tdir-document-beta` to your MCP client configuration:
 
 ---
 
-## 6. `v3.1.0-beta` Debugging & Edge-Case Hardening Log + Roadmap
+## 6. `v3.2.0-beta` 8-Cohort Parametric Regression Matrix & Roadmap
 
-### 6.1. Resolved in `v3.1.0-beta` (`P0` & `P1` Patch Set)
-1. **Stair-Step Sparse Chart Pre/Post-Spacer Compression (`[BUG-01]`, `[BUG-02]`)**: Fixed row-count check in [`./elastic_solver.py`](./elastic_solver.py) (`MinimumInvasionElasticSolver`) so stair-step chronological charts are detected and collapsed even after empty spacer columns are stripped. Reduced `Q1` table cell paragraph merges from 17 pairs down to **6 pairs** while maintaining exact 8-page compliance.
-2. **UTF-16LE Surrogate Pair & 16-Bit `WCHAR` Accounting (`[BUG-03]`)**: Fixed [`./codec_hwp_v5.py`](./codec_hwp_v5.py) to decode surrogate pairs (emojis and supplementary CJK ideographs) intact and count 16-bit `WCHAR` units in `Tag 66` and `Tag 68`.
-3. **Magic-Byte Image Format & MIME Detection (`[BUG-04]`)**: Added magic-byte header inspection in [`./ir_schema.py`](./ir_schema.py) (`PNG`, `JPEG`, `BMP`, `GIF`, `WEBP`, `EMF`, `WMF`) for dynamic `BinData` extension packing in `.hwp` and `MediaObjectIR` lifting in `.docx`.
-4. **Large `.hwp` (`> 6.8 MB`) `DIFAT` Chain & Automatic `BinData` Storage Creation (`[BUG-05]`, `[BUG-06]`)**: Upgraded [`./cfb_ole2.py`](./cfb_ole2.py) (`CFBArchive`) with full `DIFAT` sector chain reading/writing, exact fixed-point FAT sector calculation, and automatic `BinData` directory entry creation when a template lacks an existing `BinData` storage.
-5. **Explicit Margin Override Unclamping & Standalone `.docx` Synthesis (`[BUG-07]`, `[BUG-08]`, `[BUG-09]`)**: Updated [`./codec_ooxml_owpml.py`](./codec_ooxml_owpml.py) to honor explicit margin overrides (`UserSpecOverrideIR`) without clamping, synthesize self-contained `.docx` ZIP packages when converting from non-DOCX sources (`.md`, `.csv`, `.hwp`), and preserve underline formatting across `.hwp`, `.hwpx`, and `.docx`.
-6. **Edge-Case & Multi-Source Hardening (`[EDGE-01]` ~ `[EDGE-08]`, `[BUG-10]` ~ `[BUG-12]`, `[GEN-01]` ~ `[GEN-05]`)**: Added recursive nested table paragraph lifting and `<w:sdt>` unwrapping in `.docx`, HWP `Tag 77` non-zero row cell count enforcement, East-Asian-Width CJK/Latin line-wrap estimation, multi-section (`Section0..SectionN`) and uncompressed HWP stream support, Markdown code-fence and escaped-pipe (`\|`) state machine, multi-source section UID deduplication, similarity-based section-to-slot matching, immediate solver preview refresh in Tool 5 (`TdirBetaMcpServer`), and `try/finally` Word COM cleanup in Tool 4.
+### 6.1. Verified 8-Cohort Parametric Regression Matrix ([`./test_regression_suite.py`](./test_regression_suite.py))
+| Cohort ID | Experiment Scope | Verified Result |
+| :--- | :--- | :--- |
+| **`EXP-01`** | **Document Hierarchy & Unsupervised Heading Spectrum**: Korean Academic (`제1장..제3장`), English Roman (`I..III`), Unnumbered Font-Size-Jump (`14pt` vs `10pt`), and Real Grant Proposal (`SectionIR`, `SlotSpecIR`) | `PASS` |
+| **`EXP-02`** | **Numerical Page-Budget Sweep & Monotonicity**: Loose (`3p` $\to$ `0` merges), Autonomous 8-page limit (`2p` $\to$ `11` merges, exact `8` PDF pages), Tight (`1p` $\to$ `108` merges), and Asymmetric (`4:1` volume $\to$ `3p : 1p` allocation) | `PASS` |
+| **`EXP-03`** | **Metric Space & Typography Scaling**: Continuous `HWPUNIT` scaling across `A4 Landscape` (`84,189 x 59,528 HU` at `9pt`) and `B5 Portrait` (`51,591 x 72,850 HU` at `13.5pt`) | `PASS` |
+| **`EXP-04`** | **2D Table Topology Stress**: Stair-step sparse chart collapse (`5x4` $\to$ `3x3`), vertical step-arrow folding (`3x1` $\to$ `2x1`), `<w:sdt>` unwrapping, and HWP `Tag 77` row-column invariants | `PASS` |
+| **`EXP-05`** | **Generalized Template Topology**: Modified `4x2` (`4`-slot) periodic media grid discovery, automatic `BinData` storage creation, and slotless plain document projection | `PASS` |
+| **`EXP-06`** | **N-to-M Cross-Format Round-Trip**: `.docx` $\to$ `.md` (`6,155` non-ws chars) and `.docx` $\to$ `.csv` (`6,462` non-ws chars) round-trip lifting | `PASS` |
+| **`EXP-07`** | **Unicode Surrogate-Pair & Large CFB `DIFAT` Stress**: `7 WCHAR` UTF-16LE encoding for `"A🚀B𝕏\r"` in HWP `Tag 66`/`Tag 67` and `7,200,000 B` multi-sector `DIFAT` chain round-trip | `PASS` |
+| **`EXP-08`** | **Multi-Source Heterogeneous Merge & Agent Loop**: Simultaneous `[.docx, .csv, .md]` ingestion into `SlotSpecIR` slots with Tool 5 (`TdirBetaMcpServer`) paragraph lock & column width adjustment | `PASS` |
 
 ### 6.2. Upcoming Roadmap (`P2` & `P3`)
 1. **Standalone `.hwpx` Binary Image Injection (`P2`)**: Direct `<hp:pic>` XML and `BinData/` ZIP entry injection for standalone `.hwpx` output.
