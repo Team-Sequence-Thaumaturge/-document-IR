@@ -71,11 +71,19 @@ def alloc_sector_chain(blob: bytes, sector_size: int, sectors: bytearray, fat: L
     return first_s, n_sec
 
 
+MAX_CFB_DIR_ENTRIES = 8192
+MAX_CFB_STREAM_BYTES = 134_217_728
+
+
 class CFBArchive:
     def __init__(self, path: str):
         with open(path, "rb") as f:
             self.raw = f.read()
+        if len(self.raw) < 512 or self.raw[:8] != b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":
+            raise ValueError(f"Invalid MS-CFB header signature in {path}")
         self.sector_shift = struct.unpack_from("<H", self.raw, 30)[0]
+        if self.sector_shift not in (9, 12):
+            raise ValueError(f"Unsupported CFB sector shift: {self.sector_shift}")
         self.sector_size = 1 << self.sector_shift
         first_dir_sec = struct.unpack_from("<I", self.raw, 48)[0]
         first_minifat_sec = struct.unpack_from("<I", self.raw, 60)[0]
@@ -86,12 +94,16 @@ class CFBArchive:
         difat = [struct.unpack_from("<I", self.raw, 76 + i * 4)[0] for i in range(109)]
         difat = [x for x in difat if x < 0xFFFFFFFE]
 
-        # Traverse DIFAT sector chain for large CFB files (> 6.8 MB) ([BUG-05])
+        # Traverse DIFAT sector chain for large CFB files (> 6.8 MB) ([BUG-05], [SEC-03])
         entries_per_sec = self.sector_size // 4
         curr_difat = first_difat_sec
         difat_visited = 0
-        while curr_difat < 0xFFFFFFFE and difat_visited < num_difat_sec:
+        difat_seen: Set[int] = set()
+        while curr_difat < 0xFFFFFFFE and difat_visited < num_difat_sec and curr_difat not in difat_seen:
+            difat_seen.add(curr_difat)
             off_d = (curr_difat + 1) * self.sector_size
+            if off_d + self.sector_size > len(self.raw):
+                break
             d_vals = struct.unpack_from(f"<{entries_per_sec}I", self.raw, off_d)
             for fat_sec_id in d_vals[:-1]:
                 if fat_sec_id < 0xFFFFFFFE:
@@ -102,11 +114,15 @@ class CFBArchive:
         self.fat: List[int] = []
         for sec in difat:
             off = (sec + 1) * self.sector_size
-            self.fat.extend(struct.unpack_from(f"<{entries_per_sec}I", self.raw, off))
+            if off + self.sector_size <= len(self.raw):
+                self.fat.extend(struct.unpack_from(f"<{entries_per_sec}I", self.raw, off))
 
         dir_bytes = self._get_chain(first_dir_sec)
-        root_start = struct.unpack_from("<I", dir_bytes, 116)[0]
-        root_size = struct.unpack_from("<Q", dir_bytes, 120)[0]
+        root_start = struct.unpack_from("<I", dir_bytes, 116)[0] if len(dir_bytes) >= 128 else 0xFFFFFFFE
+        root_size = min(
+            struct.unpack_from("<Q", dir_bytes, 120)[0] if len(dir_bytes) >= 128 else 0,
+            MAX_CFB_STREAM_BYTES,
+        )
         ministream = self._get_chain(root_start)[:root_size] if root_size else b""
         minifat: List[int] = []
         if num_minifat_sec > 0 and first_minifat_sec < 0xFFFFFFFE:
@@ -114,23 +130,26 @@ class CFBArchive:
             minifat = list(struct.unpack_from(f"<{len(mf_bytes) // 4}I", mf_bytes, 0))
 
         self.entries: List[dict] = []
-        for i in range(0, len(dir_bytes), 128):
+        max_dir_bytes = min(len(dir_bytes), MAX_CFB_DIR_ENTRIES * 128)
+        for i in range(0, max_dir_bytes, 128):
             entry = bytearray(dir_bytes[i : i + 128])
             nlen = struct.unpack_from("<H", entry, 64)[0]
-            if nlen == 0:
+            if nlen == 0 or nlen > 64:
                 continue
             name = bytes(entry[: max(0, nlen - 2)]).decode("utf-16le", errors="replace")
             etype = entry[66]
             color = entry[67]
             left_id, right_id, child_id = struct.unpack_from("<III", entry, 68)
             st_sec = struct.unpack_from("<I", entry, 116)[0]
-            sz = struct.unpack_from("<Q", entry, 120)[0]
+            sz = min(struct.unpack_from("<Q", entry, 120)[0], MAX_CFB_STREAM_BYTES)
             stream_data = b""
             if etype == 2:
                 if sz < 4096:
                     out = bytearray()
                     s = st_sec
-                    while s < 0xFFFFFFFE and s < len(minifat):
+                    visited_mini: Set[int] = set()
+                    while s < 0xFFFFFFFE and s < len(minifat) and s not in visited_mini and len(out) < sz:
+                        visited_mini.add(s)
                         out.extend(ministream[s * 64 : (s + 1) * 64])
                         s = minifat[s]
                     stream_data = bytes(out[:sz])

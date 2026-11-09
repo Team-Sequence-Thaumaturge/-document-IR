@@ -1,9 +1,12 @@
 """
-T-DIR v3.2 Beta Isolated MCP Server (JSON-RPC 2.0 over stdio + Direct Python API).
+T-DIR v4.0 Isolated MCP Server (JSON-RPC 2.0 over stdio + Direct Python API).
 Zero hardcoded font names, pixel/HWPUNIT constants, document-specific section IDs, or fixed page counts:
   - Dynamically extracts source & target specifications at runtime (`tdir_probe_files`).
   - Resolves generic section/slot topologies (`SEC_01..SEC_K`, `SLOT_01..SLOT_M`, `MEDIA_01..MEDIA_P`)
     and numerical page budgets (`solve_document_page_budgets`) via `UserSpecOverrideIR`.
+  - Supports 8-format N-to-M conversion (`.hwp`, `.hwpx`, `.docx`, `.md`, `.csv`, `.xlsx`, `.html`, `.pdf`),
+    3-Way Equation AST isomorphism (`OMML` <-> `HWP EQN` <-> `LaTeX`), standalone `.hwpx` synthesis,
+    3-tier cross-platform PDF verification, and full security hardening (`[SEC-01]`..`[SEC-06]`).
 Exposes 5 tools:
   1. tdir_probe_files
   2. tdir_build_mapping_plan
@@ -15,11 +18,12 @@ Exposes 5 tools:
 import os
 import re
 import sys
+import copy
 import uuid
 import json
+import shutil
 import zipfile
 import subprocess
-import xml.etree.ElementTree as ET
 from typing import List, Dict, Optional, Tuple
 
 from .ir_schema import (
@@ -34,6 +38,9 @@ from .ir_schema import (
     compute_heading_slot_similarity,
     matches_section_selector,
     hu_to_pt,
+    validate_safe_filesystem_path,
+    validate_safe_zip_archive,
+    safe_parse_xml_bytes,
 )
 from .elastic_solver import (
     ElasticLayoutState,
@@ -49,7 +56,9 @@ from .codec_hwp_v5 import (
 )
 from .codec_ooxml_owpml import (
     scan_docx_style_and_page_spec,
+    scan_hwpx_source_spec,
     lift_docx_to_ir,
+    lift_hwpx_to_ir,
     project_ir_to_docx,
     project_ir_to_hwpx,
 )
@@ -58,6 +67,14 @@ from .codec_tabular_markup import (
     project_ir_to_markdown,
     lift_csv_to_ir,
     project_ir_to_csv,
+    lift_xlsx_to_ir,
+    project_ir_to_xlsx,
+    extract_xlsx_all_text,
+    lift_html_to_ir,
+    project_ir_to_html,
+    extract_html_body_text,
+    project_ir_to_pdf,
+    inspect_pdf_file,
 )
 
 
@@ -137,13 +154,21 @@ USER_SPEC_OVERRIDES_JSON_SCHEMA = {
 class TdirBetaMcpServer:
     def __init__(self) -> None:
         self.jobs: Dict[str, ConversionJobIR] = {}
+        self.max_jobs: int = 64
         self.solver = MinimumInvasionElasticSolver()
 
+    def _store_job(self, job: ConversionJobIR) -> None:
+        if len(self.jobs) >= self.max_jobs and job.job_id not in self.jobs:
+            oldest_key = next(iter(self.jobs))
+            del self.jobs[oldest_key]
+        self.jobs[job.job_id] = job
+
     def _detect_format(self, path: str) -> str:
-        ext = os.path.splitext(path)[1].lower()
-        with open(path, "rb") as f:
-            head = f.read(8)
-        if head == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":
+        safe_path = validate_safe_filesystem_path(path, must_exist=True)
+        ext = os.path.splitext(safe_path)[1].lower()
+        with open(safe_path, "rb") as f:
+            head = f.read(64)
+        if head[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":
             return "HWP_V5_BINARY"
         if head[:4] == b"PK\x03\x04":
             if ext == ".hwpx":
@@ -151,6 +176,10 @@ class TdirBetaMcpServer:
             if ext == ".xlsx":
                 return "XLSX_OOXML"
             return "DOCX_OOXML"
+        if head[:5] == b"%PDF-" or ext == ".pdf":
+            return "PDF"
+        if ext in (".html", ".htm") or b"<html" in head.lower() or b"<!doctype html" in head.lower():
+            return "HTML"
         if ext in (".md", ".markdown"):
             return "MARKDOWN"
         if ext == ".csv":
@@ -215,14 +244,19 @@ class TdirBetaMcpServer:
         }
 
     def tdir_probe_files(self, source_paths: List[str], target_path: str) -> dict:
+        safe_target_path = validate_safe_filesystem_path(target_path, must_exist=True)
+        safe_source_paths = [validate_safe_filesystem_path(sp, must_exist=True) for sp in source_paths]
+
         job_id = f"job_{uuid.uuid4().hex[:8]}"
-        raw_target_spec = scan_hwp_template_slots(target_path)
+        raw_target_spec = scan_hwp_template_slots(safe_target_path)
 
         source_specs: List[SourceDocumentSpecIR] = []
-        for sp in source_paths:
+        for sp in safe_source_paths:
             fmt = self._detect_format(sp)
             if fmt == "DOCX_OOXML":
                 source_specs.append(scan_docx_style_and_page_spec(sp))
+            elif fmt == "HWPX_OWPML":
+                source_specs.append(scan_hwpx_source_spec(sp))
             elif fmt == "HWP_V5_BINARY":
                 source_specs.append(scan_hwp_source_spec(sp))
             else:
@@ -239,17 +273,23 @@ class TdirBetaMcpServer:
         all_sections: Dict[str, SectionIR] = {}
         sources_report: List[dict] = []
 
-        for idx_s, sp in enumerate(source_paths):
+        for idx_s, sp in enumerate(safe_source_paths):
             fmt = source_specs[idx_s].source_format
             s_spec = source_specs[idx_s]
             if fmt == "DOCX_OOXML":
                 secs = lift_docx_to_ir(sp, target_width_hu=avail_w, table_font_size_hu=tbl_sz_hu)
+            elif fmt == "HWPX_OWPML":
+                secs = lift_hwpx_to_ir(sp, target_width_hu=avail_w, table_font_size_hu=tbl_sz_hu)
             elif fmt == "MARKDOWN":
                 secs = lift_markdown_to_ir(sp, target_width_hu=avail_w)
             elif fmt == "CSV":
                 secs = lift_csv_to_ir(sp, delimiter=",", target_width_hu=avail_w)
             elif fmt == "TSV":
                 secs = lift_csv_to_ir(sp, delimiter="\t", target_width_hu=avail_w)
+            elif fmt == "XLSX_OOXML":
+                secs = lift_xlsx_to_ir(sp, target_width_hu=avail_w)
+            elif fmt == "HTML":
+                secs = lift_html_to_ir(sp, target_width_hu=avail_w)
             elif fmt == "HWP_V5_BINARY":
                 _, blks = lift_hwp_to_ir(sp)
                 _, nc, sha = extract_ir_non_ws_text(blks)
@@ -306,14 +346,14 @@ class TdirBetaMcpServer:
 
         job = ConversionJobIR(
             job_id=job_id,
-            source_paths=source_paths,
-            target_path=target_path,
+            source_paths=safe_source_paths,
+            target_path=safe_target_path,
             sections=all_sections,
             source_specs=source_specs,
             raw_target_spec=raw_target_spec,
             target_spec=effective_spec,
         )
-        self.jobs[job_id] = job
+        self._store_job(job)
 
         return {
             "job_id": job_id,
@@ -412,7 +452,7 @@ class TdirBetaMcpServer:
             avail_w = matched_slot.available_width_hu if matched_slot else 46200
             max_p = float(budget_solution["section_budgets"].get(s_uid, matched_slot.max_pages if matched_slot else 2.0))
             _, _, tele = self.solver.solve_section_layout_budget(
-                s_obj.blocks,
+                copy.deepcopy(s_obj.blocks),
                 target_pages=max_p,
                 outer_width_hu=avail_w,
                 target_spec=eff_spec,
@@ -455,6 +495,13 @@ class TdirBetaMcpServer:
         base_hwpx_path: Optional[str] = None,
         user_spec_overrides: Optional[dict] = None,
     ) -> dict:
+        safe_prefix = validate_safe_filesystem_path(output_prefix, must_exist=False)
+        safe_base_hwpx = (
+            validate_safe_filesystem_path(base_hwpx_path, must_exist=True)
+            if base_hwpx_path and os.path.exists(base_hwpx_path)
+            else None
+        )
+
         job = self.jobs[job_id]
         assert job.raw_target_spec is not None
 
@@ -491,7 +538,7 @@ class TdirBetaMcpServer:
             avail_w = sl_spec.available_width_hu if sl_spec else 46200
             max_p = sl_spec.max_pages if sl_spec else 2.0
             solved_blocks, el_state, tele = self.solver.solve_section_layout_budget(
-                s_obj.blocks,
+                copy.deepcopy(s_obj.blocks),
                 target_pages=max_p,
                 outer_width_hu=avail_w,
                 target_spec=eff_spec,
@@ -525,10 +572,11 @@ class TdirBetaMcpServer:
                     attachment_captions.append(cap_str)
 
         results: Dict[str, dict] = {}
-        os.makedirs(os.path.dirname(os.path.abspath(output_prefix)), exist_ok=True)
+        os.makedirs(os.path.dirname(os.path.abspath(safe_prefix)), exist_ok=True)
+        job.output_files = {}
 
         if "hwp" in formats:
-            out_hwp = f"{output_prefix}.hwp"
+            out_hwp = f"{safe_prefix}.hwp"
             results["hwp"] = project_ir_to_hwp(
                 job.target_path,
                 out_hwp,
@@ -539,10 +587,11 @@ class TdirBetaMcpServer:
             )
             job.output_files["hwp"] = out_hwp
 
-        if "docx" in formats and job.source_paths:
-            out_docx = f"{output_prefix}.docx"
+        if "docx" in formats:
+            out_docx = f"{safe_prefix}.docx"
+            src_docx_ref = job.source_paths[0] if job.source_paths else ""
             results["docx"] = project_ir_to_docx(
-                job.source_paths[0],
+                src_docx_ref,
                 out_docx,
                 eff_spec,
                 slot_blocks_map,
@@ -552,14 +601,15 @@ class TdirBetaMcpServer:
             )
             job.output_files["docx"] = out_docx
 
-        if "hwpx" in formats and base_hwpx_path and os.path.exists(base_hwpx_path):
-            out_hwpx = f"{output_prefix}.hwpx"
+        if "hwpx" in formats:
+            out_hwpx = f"{safe_prefix}.hwpx"
             results["hwpx"] = project_ir_to_hwpx(
-                base_hwpx_path,
+                safe_base_hwpx,
                 out_hwpx,
                 eff_spec,
                 slot_blocks_map,
                 attachment_captions,
+                attachments=attachments_hwp,
             )
             job.output_files["hwpx"] = out_hwpx
 
@@ -567,7 +617,9 @@ class TdirBetaMcpServer:
             k: SectionIR(
                 section_uid=k,
                 heading_text=job.sections[k].heading_text,
+                subtitle_text=job.sections[k].subtitle_text,
                 blocks=slot_blocks_map[v][0],
+                media_objects=job.sections[k].media_objects,
                 ordinal_index=job.sections[k].ordinal_index,
                 section_role=job.sections[k].section_role,
             )
@@ -576,14 +628,44 @@ class TdirBetaMcpServer:
         }
 
         if "md" in formats:
-            out_md = f"{output_prefix}.md"
+            out_md = f"{safe_prefix}.md"
             results["md"] = project_ir_to_markdown(active_secs or job.sections, out_md)
             job.output_files["md"] = out_md
 
         if "csv" in formats:
-            out_csv = f"{output_prefix}.csv"
+            out_csv = f"{safe_prefix}.csv"
             results["csv"] = project_ir_to_csv(active_secs or job.sections, out_csv, delimiter=",")
             job.output_files["csv"] = out_csv
+
+        if "xlsx" in formats:
+            out_xlsx = f"{safe_prefix}.xlsx"
+            results["xlsx"] = project_ir_to_xlsx(active_secs or job.sections, out_xlsx)
+            job.output_files["xlsx"] = out_xlsx
+
+        if "html" in formats:
+            out_html = f"{safe_prefix}.html"
+            results["html"] = project_ir_to_html(
+                active_secs or job.sections,
+                out_html,
+                target_spec=eff_spec,
+                attachments=attachments_hwp,
+            )
+            job.output_files["html"] = out_html
+
+        if "pdf" in formats:
+            out_pdf = f"{safe_prefix}.pdf"
+            expected_total = job.page_budget_solution.get("expected_total_pages")
+            results["pdf"] = project_ir_to_pdf(
+                active_secs or job.sections,
+                out_pdf,
+                target_spec=eff_spec,
+                slot_blocks_map=slot_blocks_map,
+                attachments=attachments_hwp,
+                expected_total_pages=expected_total,
+                clear_unmapped_slots=overrides_ir.clear_unmapped_slots,
+                preserve_outer_tables=overrides_ir.preserve_outer_tables,
+            )
+            job.output_files["pdf"] = out_pdf
 
         return {
             "job_id": job_id,
@@ -591,6 +673,100 @@ class TdirBetaMcpServer:
             "page_budget_solution": job.page_budget_solution,
             "generated_files": results,
             "solver_telemetry": job.solver_telemetry,
+        }
+
+    def _export_or_verify_pdf_3tier(self, job: ConversionJobIR) -> dict:
+        """
+        3-Tier Cross-Platform PDF Verification Engine (`[P3-02]`):
+          - Tier 1: Windows MS Word COM (`ExportAsFixedFormat(..., 17)`) when `.docx` output and MS Word are available.
+          - Tier 2: Headless LibreOffice (`soffice --headless --convert-to pdf`) when `soffice` is on PATH.
+          - Tier 3: Built-in Pure-Python Deterministic PDF 1.4 Layout & UTF-16BE Text Verifier (`project_ir_to_pdf`).
+        """
+        expected_total = job.page_budget_solution.get("expected_total_pages")
+        active_sec_uids = [k for k in job.slot_mapping.keys() if k in job.sections]
+
+        if "pdf" in job.output_files and os.path.exists(job.output_files["pdf"]):
+            pdf_path = job.output_files["pdf"]
+            pdf_meta = inspect_pdf_file(pdf_path)
+            sec_checks = {
+                s_uid: validate_text_immutability(job.sections[s_uid].blocks, pdf_meta["extracted_text"])
+                for s_uid in active_sec_uids
+            }
+            return {
+                "path": pdf_path,
+                "tier_used": "BUILTIN_DETERMINISTIC_PDF14",
+                "bytes": pdf_meta["bytes"],
+                "actual_pdf_pages": pdf_meta["actual_pdf_pages"],
+                "expected_total_pages": expected_total,
+                "page_budget_matched": (
+                    pdf_meta["actual_pdf_pages"] == expected_total if expected_total is not None else True
+                ),
+                "section_checks": sec_checks,
+                "all_sections_verified": all(v["substring_contained"] for v in sec_checks.values()),
+            }
+
+        docx_path = job.output_files.get("docx")
+        pdf_path = (
+            os.path.splitext(docx_path)[0] + "_PDF.pdf"
+            if docx_path
+            else os.path.join(os.path.dirname(job.target_path), f"{job.job_id}_PDF.pdf")
+        )
+        tier_used = "BUILTIN_DETERMINISTIC_PDF14"
+
+        if docx_path and os.path.exists(docx_path) and os.name == "nt":
+            esc_docx = os.path.abspath(docx_path).replace("'", "''")
+            esc_pdf = os.path.abspath(pdf_path).replace("'", "''")
+            ps_cmd = (
+                f"$w = $null; $d = $null; "
+                f"try {{ "
+                f"$w = New-Object -ComObject Word.Application; $w.Visible = $false; "
+                f"$d = $w.Documents.Open('{esc_docx}'); "
+                f"$d.ExportAsFixedFormat('{esc_pdf}', 17); "
+                f"}} finally {{ "
+                f"if ($d) {{ $d.Close($false) }}; "
+                f"if ($w) {{ $w.Quit() }} "
+                f"}}"
+            )
+            proc = subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd], capture_output=True)
+            if proc.returncode == 0 and os.path.exists(pdf_path):
+                tier_used = "MS_WORD_COM"
+
+        if tier_used == "BUILTIN_DETERMINISTIC_PDF14" and docx_path and os.path.exists(docx_path):
+            soffice_bin = shutil.which("soffice") or shutil.which("libreoffice")
+            if soffice_bin:
+                out_dir = os.path.dirname(os.path.abspath(pdf_path))
+                proc = subprocess.run(
+                    [soffice_bin, "--headless", "--convert-to", "pdf", "--outdir", out_dir, docx_path],
+                    capture_output=True,
+                )
+                lo_pdf = os.path.splitext(docx_path)[0] + ".pdf"
+                if proc.returncode == 0 and os.path.exists(lo_pdf):
+                    if os.path.abspath(lo_pdf) != os.path.abspath(pdf_path):
+                        shutil.move(lo_pdf, pdf_path)
+                    tier_used = "LIBREOFFICE_HEADLESS"
+
+        if tier_used == "BUILTIN_DETERMINISTIC_PDF14":
+            active_secs = {
+                k: job.sections[k] for k in active_sec_uids
+            } or job.sections
+            project_ir_to_pdf(
+                active_secs,
+                pdf_path,
+                target_spec=job.target_spec,
+                expected_total_pages=expected_total,
+            )
+
+        job.output_files["pdf"] = pdf_path
+        pdf_meta = inspect_pdf_file(pdf_path)
+        return {
+            "path": pdf_path,
+            "tier_used": tier_used,
+            "bytes": pdf_meta["bytes"],
+            "actual_pdf_pages": pdf_meta["actual_pdf_pages"],
+            "expected_total_pages": expected_total,
+            "page_budget_matched": (
+                pdf_meta["actual_pdf_pages"] == expected_total if expected_total is not None else True
+            ),
         }
 
     def tdir_verify_fidelity_and_layout(self, job_id: str, export_pdf: bool = True) -> dict:
@@ -612,8 +788,9 @@ class TdirBetaMcpServer:
             }
 
         if "hwpx" in job.output_files and os.path.exists(job.output_files["hwpx"]):
+            validate_safe_zip_archive(job.output_files["hwpx"])
             with zipfile.ZipFile(job.output_files["hwpx"], "r") as zf:
-                s0_root = ET.fromstring(zf.read("Contents/section0.xml"))
+                s0_root = safe_parse_xml_bytes(zf.read("Contents/section0.xml"))
                 hwpx_txt = "".join(s0_root.itertext())
             sec_checks = {
                 s_uid: validate_text_immutability(job.sections[s_uid].blocks, hwpx_txt)
@@ -626,8 +803,9 @@ class TdirBetaMcpServer:
             }
 
         if "docx" in job.output_files and os.path.exists(job.output_files["docx"]):
+            validate_safe_zip_archive(job.output_files["docx"])
             with zipfile.ZipFile(job.output_files["docx"], "r") as zf:
-                d_root = ET.fromstring(zf.read("word/document.xml"))
+                d_root = safe_parse_xml_bytes(zf.read("word/document.xml"))
                 docx_txt = "".join(d_root.itertext())
             sec_checks = {
                 s_uid: validate_text_immutability(job.sections[s_uid].blocks, docx_txt)
@@ -639,34 +817,32 @@ class TdirBetaMcpServer:
                 "all_sections_verified": all(v["substring_contained"] for v in sec_checks.values()),
             }
 
-            if export_pdf:
-                pdf_path = os.path.splitext(job.output_files["docx"])[0] + "_PDF.pdf"
-                esc_docx = os.path.abspath(job.output_files["docx"]).replace("'", "''")
-                esc_pdf = os.path.abspath(pdf_path).replace("'", "''")
-                ps_cmd = (
-                    f"$w = $null; $d = $null; "
-                    f"try {{ "
-                    f"$w = New-Object -ComObject Word.Application; $w.Visible = $false; "
-                    f"$d = $w.Documents.Open('{esc_docx}'); "
-                    f"$d.ExportAsFixedFormat('{esc_pdf}', 17); "
-                    f"}} finally {{ "
-                    f"if ($d) {{ $d.Close($false) }}; "
-                    f"if ($w) {{ $w.Quit() }} "
-                    f"}}"
-                )
-                subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd], check=True)
-                job.output_files["pdf"] = pdf_path
-                with open(pdf_path, "rb") as f_pdf:
-                    raw_pdf = f_pdf.read()
-                actual_pdf_pages = len(re.findall(rb"/Type\s*/Page\b(?!s)", raw_pdf))
-                expected_total = job.page_budget_solution.get("expected_total_pages")
-                fidelity_results["pdf"] = {
-                    "path": pdf_path,
-                    "bytes": os.path.getsize(pdf_path),
-                    "actual_pdf_pages": actual_pdf_pages,
-                    "expected_total_pages": expected_total,
-                    "page_budget_matched": (actual_pdf_pages == expected_total) if expected_total is not None else True,
-                }
+        if "xlsx" in job.output_files and os.path.exists(job.output_files["xlsx"]):
+            xlsx_txt = extract_xlsx_all_text(job.output_files["xlsx"])
+            sec_checks = {
+                s_uid: validate_text_immutability(job.sections[s_uid].blocks, xlsx_txt)
+                for s_uid in active_sec_uids
+            }
+            fidelity_results["xlsx"] = {
+                "path": job.output_files["xlsx"],
+                "section_checks": sec_checks,
+                "all_sections_verified": all(v["substring_contained"] for v in sec_checks.values()),
+            }
+
+        if "html" in job.output_files and os.path.exists(job.output_files["html"]):
+            html_txt = extract_html_body_text(job.output_files["html"])
+            sec_checks = {
+                s_uid: validate_text_immutability(job.sections[s_uid].blocks, html_txt)
+                for s_uid in active_sec_uids
+            }
+            fidelity_results["html"] = {
+                "path": job.output_files["html"],
+                "section_checks": sec_checks,
+                "all_sections_verified": all(v["substring_contained"] for v in sec_checks.values()),
+            }
+
+        if export_pdf or "pdf" in job.output_files:
+            fidelity_results["pdf"] = self._export_or_verify_pdf_3tier(job)
 
         return {
             "job_id": job_id,
@@ -715,7 +891,7 @@ class TdirBetaMcpServer:
         avail_w = sl_spec.available_width_hu if sl_spec else 46200
         max_p = sl_spec.max_pages if sl_spec else 2.0
         _, _, updated_tele = self.solver.solve_section_layout_budget(
-            sec.blocks,
+            copy.deepcopy(sec.blocks),
             target_pages=max_p,
             outer_width_hu=avail_w,
             target_spec=eff_spec,
@@ -737,8 +913,8 @@ MCP_TOOLS_SCHEMA = [
     {
         "name": "tdir_probe_files",
         "description": (
-            "Dynamically inspect source documents (.docx, .hwp, .hwpx, .md, .csv, .tsv) and target template "
-            "typography, page geometry, and slots without hardcoding text, fonts, or record offsets."
+            "Dynamically inspect source documents (.docx, .hwp, .hwpx, .md, .csv, .tsv, .xlsx, .html) and target "
+            "template typography, page geometry, and slots without hardcoding text, fonts, or record offsets."
         ),
         "inputSchema": {
             "type": "object",
@@ -768,8 +944,8 @@ MCP_TOOLS_SCHEMA = [
     {
         "name": "tdir_execute_conversion",
         "description": (
-            "Execute T-DIR v3.0 conversion into target formats (.hwp, .hwpx, .docx, .md) using dynamically resolved "
-            "specifications and optional user_spec_overrides with 100% text preservation."
+            "Execute T-DIR v4.0 conversion into target formats (.hwp, .hwpx, .docx, .md, .csv, .xlsx, .html, .pdf) "
+            "using dynamically resolved specifications and optional user_spec_overrides with 100% text preservation."
         ),
         "inputSchema": {
             "type": "object",
@@ -785,7 +961,10 @@ MCP_TOOLS_SCHEMA = [
     },
     {
         "name": "tdir_verify_fidelity_and_layout",
-        "description": "Verify 100.00% non-whitespace SHA-256 text immutability across generated outputs and optionally export headless PDF for page boundary check.",
+        "description": (
+            "Verify 100.00% non-whitespace SHA-256 text immutability across generated outputs and execute "
+            "3-tier cross-platform PDF page-budget verification (MS Word COM / LibreOffice / Built-in PDF 1.4)."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -825,7 +1004,7 @@ def handle_jsonrpc_request(server: TdirBetaMcpServer, req: dict) -> Optional[dic
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "tdir-document-beta", "version": "3.2.0-beta"},
+                "serverInfo": {"name": "tdir-document-beta", "version": "4.0.0"},
             },
         }
     if method == "notifications/initialized":

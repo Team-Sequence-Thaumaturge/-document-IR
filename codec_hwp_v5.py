@@ -21,8 +21,31 @@ from .ir_schema import (
     TargetDocumentSpecIR,
     detect_image_format,
     extract_ordinal_index,
+    strip_illegal_xml_control_chars,
+    parse_hwpeqn_to_equation_ast,
+    compile_equation_ast_to_hwpeqn,
+    compile_equation_ast_to_linear_text,
 )
 from .elastic_solver import ElasticLayoutState
+
+MAX_HWP_DECOMPRESSED_STREAM_BYTES = 67_108_864
+HWPTAG_EQEDIT = 105
+
+
+def make_hwp_eqedit_payload(hwpeqn_script: str) -> bytes:
+    script_u16 = strip_illegal_xml_control_chars(hwpeqn_script).encode("utf-16le")
+    char_len = len(script_u16) // 2
+    return struct.pack("<IH", 0x00000000, char_len) + script_u16 + struct.pack("<i", 1000)
+
+
+def parse_hwp_eqedit_payload(payload: bytes) -> str:
+    if len(payload) < 6:
+        return ""
+    char_len = struct.unpack_from("<H", payload, 4)[0]
+    byte_end = 6 + char_len * 2
+    if byte_end <= len(payload):
+        return payload[6:byte_end].decode("utf-16le", errors="replace").strip()
+    return ""
 
 
 def pack_hwp_record(tag_id: int, level: int, payload: bytes) -> bytes:
@@ -72,7 +95,13 @@ def _read_hwp_stream(cfb: CFBArchive, stream_name: str) -> bytes:
     raw = cfb.get_stream(stream_name)
     if _is_hwp_compressed(cfb):
         try:
-            return zlib.decompress(raw, -15)
+            dobj = zlib.decompressobj(-15)
+            out = dobj.decompress(raw, MAX_HWP_DECOMPRESSED_STREAM_BYTES + 1)
+            if len(out) > MAX_HWP_DECOMPRESSED_STREAM_BYTES or dobj.unconsumed_tail:
+                raise ValueError(
+                    f"HWP stream {stream_name} exceeds maximum decompressed size ({MAX_HWP_DECOMPRESSED_STREAM_BYTES} B)"
+                )
+            return out
         except zlib.error:
             return raw
     return raw
@@ -555,7 +584,7 @@ def scan_hwp_source_spec(hwp_path: str) -> SourceDocumentSpecIR:
 
 def lift_hwp_to_ir(hwp_path: str) -> Tuple[str, List[dict]]:
     """
-    Lifts all Section0..SectionN streams from an HWP v5.0 file ([EDGE-05], [EDGE-06]).
+    Lifts all Section0..SectionN streams from an HWP v5.0 file ([EDGE-05], [EDGE-06], [P2-02]).
     """
     cfb = CFBArchive(hwp_path)
     sec_names = sorted(
@@ -588,6 +617,36 @@ def lift_hwp_to_ir(hwp_path: str) -> Tuple[str, List[dict]]:
                             "r_embed": None,
                         }
                     )
+            elif tag_id == HWPTAG_EQEDIT:
+                eq_script = parse_hwp_eqedit_payload(payload)
+                if eq_script:
+                    eq_ast = parse_hwpeqn_to_equation_ast(eq_script)
+                    lin_txt = compile_equation_ast_to_linear_text(eq_ast)
+                    if blocks and blocks[-1].get("type") == "p" and blocks[-1].get("runs"):
+                        blocks[-1]["runs"][-1]["equation_ast"] = eq_ast
+                    elif lin_txt:
+                        all_texts.append(lin_txt)
+                        blocks.append(
+                            {
+                                "type": "p",
+                                "jc": "both",
+                                "left_tw": 0,
+                                "right_tw": 0,
+                                "indent_tw": 0,
+                                "before_tw": 0,
+                                "after_tw": 10,
+                                "runs": [
+                                    {
+                                        "text": lin_txt,
+                                        "bold": False,
+                                        "italic": False,
+                                        "color": "000000",
+                                        "equation_ast": eq_ast,
+                                    }
+                                ],
+                                "r_embed": None,
+                            }
+                        )
     return "".join(all_texts), blocks
 
 
@@ -781,10 +840,17 @@ def project_ir_to_hwp(
 
         text_buf = bytearray()
         cs_pairs: List[Tuple[int, int]] = []
+        eq_records: List[list] = []
         char_pos = 0
         last_cs_id: Optional[int] = None
         for r in runs:
-            txt = r["text"]
+            eq_ast = r.get("equation_ast")
+            txt = strip_illegal_xml_control_chars(str(r.get("text", "")))
+            if eq_ast and not txt:
+                txt = compile_equation_ast_to_linear_text(eq_ast)
+            if eq_ast:
+                hwpeqn_str = compile_equation_ast_to_hwpeqn(eq_ast)
+                eq_records.append([HWPTAG_EQEDIT, para_level + 1, make_hwp_eqedit_payload(hwpeqn_str)])
             if not txt:
                 continue
             cs_id = get_or_add_cs(
@@ -814,6 +880,7 @@ def project_ir_to_hwp(
             [66, para_level, phdr],
             [67, para_level + 1, bytes(text_buf)],
             [68, para_level + 1, pcs],
+            *eq_records,
         ]
 
     def build_inner_table_records(

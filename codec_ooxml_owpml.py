@@ -28,6 +28,16 @@ from .ir_schema import (
     extract_ordinal_index,
     is_top_level_section_heading,
     is_subtitle_or_instruction_line,
+    strip_illegal_xml_control_chars,
+    sanitize_archive_rel_path,
+    validate_safe_zip_archive,
+    safe_parse_xml_bytes,
+    NS_OMML,
+    parse_omml_to_equation_ast,
+    parse_hwpeqn_to_equation_ast,
+    compile_equation_ast_to_omml_element,
+    compile_equation_ast_to_hwpeqn,
+    compile_equation_ast_to_linear_text,
 )
 from .elastic_solver import (
     ElasticLayoutState,
@@ -43,6 +53,11 @@ WP_NS = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
 A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
 PIC_NS = "http://schemas.openxmlformats.org/drawingml/2006/picture"
 R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+HP_NS = "http://www.hancom.co.kr/hwpml/2011/paragraph"
+HS_NS = "http://www.hancom.co.kr/hwpml/2011/section"
+HC_NS = "http://www.hancom.co.kr/hwpml/2011/core"
+HH_NS = "http://www.hancom.co.kr/hwpml/2011/head"
+OPF_NS = "http://www.idpf.org/2007/opf/"
 
 for _pfx, _uri in (
     ("w", W_NS),
@@ -50,6 +65,7 @@ for _pfx, _uri in (
     ("a", A_NS),
     ("pic", PIC_NS),
     ("r", R_NS),
+    ("m", NS_OMML),
     ("mc", "http://schemas.openxmlformats.org/markup-compatibility/2006"),
     ("w14", "http://schemas.microsoft.com/office/word/2010/wordml"),
     ("wp14", "http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing"),
@@ -72,14 +88,15 @@ def scan_docx_style_and_page_spec(docx_path: str) -> SourceDocumentSpecIR:
     table_sizes_hu: Dict[int, int] = {}
 
     with zipfile.ZipFile(docx_path, "r") as zf:
+        validate_safe_zip_archive(zf)
         if "word/styles.xml" in zf.namelist():
-            styles_root = ET.fromstring(zf.read("word/styles.xml"))
+            styles_root = safe_parse_xml_bytes(zf.read("word/styles.xml"))
             for rFonts in styles_root.findall(f".//{w_tag('rFonts')}"):
                 fn = rFonts.get(w_tag("eastAsia")) or rFonts.get(w_tag("ascii"))
                 if fn:
                     body_fonts[fn] = body_fonts.get(fn, 0) + 1
 
-        doc_root = ET.fromstring(zf.read("word/document.xml"))
+        doc_root = safe_parse_xml_bytes(zf.read("word/document.xml"))
         body = doc_root.find(w_tag("body"))
         if body is not None:
             sectPr = body.find(w_tag("sectPr"))
@@ -182,48 +199,69 @@ def extract_docx_p_data(p_el: ET.Element, is_in_table: bool) -> dict:
 
     runs: List[dict] = []
     max_sz_hu = 0
-    for r_el in p_el.findall(f".//{w_tag('r')}"):
-        t_texts = [t.text for t in r_el.findall(w_tag("t")) if t.text]
-        txt = "".join(t_texts)
-        if not txt:
-            continue
-        txt = "".join(ch for ch in txt if ord(ch) >= 32)
-        if not txt:
-            continue
-        rPr = r_el.find(w_tag("rPr"))
-        bold = False
-        italic = False
-        underline = False
-        color_hex = "000000"
-        if rPr is not None:
-            b_el = rPr.find(w_tag("b"))
-            if b_el is not None and b_el.get(w_tag("val"), "true") not in ("0", "false"):
-                bold = True
-            i_el = rPr.find(w_tag("i"))
-            if i_el is not None and i_el.get(w_tag("val"), "true") not in ("0", "false"):
-                italic = True
-            u_el = rPr.find(w_tag("u"))
-            if u_el is not None and u_el.get(w_tag("val"), "single") not in ("0", "false", "none"):
-                underline = True
-            c_el = rPr.find(w_tag("color"))
-            if c_el is not None:
-                c_val = c_el.get(w_tag("val"), "000000")
-                if c_val and c_val != "auto":
-                    color_hex = c_val.upper()
-            sz_el = rPr.find(w_tag("sz"))
-            if sz_el is not None:
-                hp_val = int(sz_el.get(w_tag("val"), "0") or 0)
-                if hp_val > 0:
-                    max_sz_hu = max(max_sz_hu, hp_val * 50)
-        runs.append(
-            {
-                "text": txt,
-                "bold": bold,
-                "italic": italic,
-                "underline": underline,
-                "color": color_hex,
-            }
-        )
+
+    def _collect_p_children(container: ET.Element) -> None:
+        nonlocal max_sz_hu
+        for ch_el in container:
+            lt = ch_el.tag.split("}")[-1] if "}" in ch_el.tag else ch_el.tag
+            if lt in ("oMath", "oMathPara"):
+                eq_ast = parse_omml_to_equation_ast(ch_el)
+                lin_txt = compile_equation_ast_to_linear_text(eq_ast)
+                if lin_txt:
+                    runs.append(
+                        {
+                            "text": lin_txt,
+                            "bold": False,
+                            "italic": False,
+                            "underline": False,
+                            "color": "000000",
+                            "equation_ast": eq_ast,
+                        }
+                    )
+            elif ch_el.tag == w_tag("r"):
+                t_texts = [t.text for t in ch_el.findall(w_tag("t")) if t.text]
+                txt = strip_illegal_xml_control_chars("".join(t_texts))
+                txt = "".join(ch for ch in txt if ord(ch) >= 32)
+                if not txt:
+                    continue
+                rPr = ch_el.find(w_tag("rPr"))
+                bold = False
+                italic = False
+                underline = False
+                color_hex = "000000"
+                if rPr is not None:
+                    b_el = rPr.find(w_tag("b"))
+                    if b_el is not None and b_el.get(w_tag("val"), "true") not in ("0", "false"):
+                        bold = True
+                    i_el = rPr.find(w_tag("i"))
+                    if i_el is not None and i_el.get(w_tag("val"), "true") not in ("0", "false"):
+                        italic = True
+                    u_el = rPr.find(w_tag("u"))
+                    if u_el is not None and u_el.get(w_tag("val"), "single") not in ("0", "false", "none"):
+                        underline = True
+                    c_el = rPr.find(w_tag("color"))
+                    if c_el is not None:
+                        c_val = c_el.get(w_tag("val"), "000000")
+                        if c_val and c_val != "auto":
+                            color_hex = c_val.upper()
+                    sz_el = rPr.find(w_tag("sz"))
+                    if sz_el is not None:
+                        hp_val = int(sz_el.get(w_tag("val"), "0") or 0)
+                        if hp_val > 0:
+                            max_sz_hu = max(max_sz_hu, hp_val * 50)
+                runs.append(
+                    {
+                        "text": txt,
+                        "bold": bold,
+                        "italic": italic,
+                        "underline": underline,
+                        "color": color_hex,
+                    }
+                )
+            elif lt in ("hyperlink", "smartTag", "ins", "sdtContent", "sdt"):
+                _collect_p_children(ch_el)
+
+    _collect_p_children(p_el)
 
     return {
         "type": "p",
@@ -354,16 +392,17 @@ def lift_docx_to_ir(
     """
     sections: Dict[str, SectionIR] = {}
     with zipfile.ZipFile(docx_path, "r") as zf:
+        validate_safe_zip_archive(zf)
         rels_map: Dict[str, str] = {}
         if "word/_rels/document.xml.rels" in zf.namelist():
-            rels_root = ET.fromstring(zf.read("word/_rels/document.xml.rels"))
+            rels_root = safe_parse_xml_bytes(zf.read("word/_rels/document.xml.rels"))
             for rel in rels_root:
                 rid = rel.get("Id", "")
                 target = rel.get("Target", "")
                 if rid and target:
                     rels_map[rid] = target
 
-        doc_root = ET.fromstring(zf.read("word/document.xml"))
+        doc_root = safe_parse_xml_bytes(zf.read("word/document.xml"))
         body = doc_root.find(w_tag("body"))
         raw_children = list(body) if body is not None else []
         children = _unwrap_sdt_elements(raw_children)
@@ -452,7 +491,7 @@ def lift_docx_to_ir(
                     continue
 
                 if pdata["r_embed"] and pdata["r_embed"] in rels_map:
-                    rel_target = rels_map[pdata["r_embed"]].lstrip("/")
+                    rel_target = sanitize_archive_rel_path(rels_map[pdata["r_embed"]])
                     zip_media_path = rel_target if rel_target.startswith("word/") else f"word/{rel_target}"
                     if zip_media_path in zf.namelist():
                         raw_img = zf.read(zip_media_path)
@@ -507,6 +546,7 @@ def project_ir_to_docx(
     has_valid_src_docx = False
     if source_docx_path and os.path.isfile(source_docx_path) and zipfile.is_zipfile(source_docx_path):
         with zipfile.ZipFile(source_docx_path, "r") as z_chk:
+            validate_safe_zip_archive(z_chk)
             if "word/document.xml" in z_chk.namelist():
                 has_valid_src_docx = True
 
@@ -520,14 +560,15 @@ def project_ir_to_docx(
             b'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" '
             b'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" '
             b'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
-            b'xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">'
+            b'xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture" '
+            b'xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math">'
             b'<w:body><w:sectPr><w:pgSz w:w="11906" w:h="16838"/>'
             b'<w:pgMar w:top="560" w:right="950" w:bottom="560" w:left="950" w:header="360" w:footer="360" w:gutter="0"/>'
             b'</w:sectPr></w:body></w:document>'
         )
 
     if True:
-        root = ET.fromstring(doc_xml)
+        root = safe_parse_xml_bytes(doc_xml)
         for k in list(root.attrib.keys()):
             if k.endswith("Ignorable"):
                 del root.attrib[k]
@@ -610,7 +651,11 @@ def project_ir_to_docx(
             )
             ET.SubElement(pPr, w_tag("jc"), {w_tag("val"): jc})
             for r_info in runs:
-                txt = r_info["text"]
+                eq_ast = r_info.get("equation_ast")
+                if eq_ast:
+                    p.append(compile_equation_ast_to_omml_element(eq_ast))
+                    continue
+                txt = strip_illegal_xml_control_chars(str(r_info.get("text", "")))
                 if not txt:
                     continue
                 r = ET.SubElement(p, w_tag("r"))
@@ -991,7 +1036,7 @@ def project_ir_to_docx(
                 ET.SubElement(aGrid, w_tag("gridCol"), {w_tag("w"): str(att_col_tw)})
 
             def scale_drawing_xml(raw_p_xml: bytes, target_cx: int, target_cy: int) -> ET.Element:
-                p_copy = ET.fromstring(raw_p_xml)
+                p_copy = safe_parse_xml_bytes(raw_p_xml)
                 pPr = p_copy.find(w_tag("pPr"))
                 if pPr is None:
                     pPr = ET.Element(w_tag("pPr"))
@@ -1129,16 +1174,19 @@ def project_ir_to_docx(
 
 
 def project_ir_to_hwpx(
-    base_hwpx_path: str,
+    base_hwpx_path: Optional[str],
     out_hwpx_path: str,
     target_spec: TargetDocumentSpecIR,
     slot_blocks_map: Dict[str, Tuple[List[dict], ElasticLayoutState]],
     attachment_captions: List[str],
+    attachments: Optional[List[Tuple[bytes, str]]] = None,
 ) -> dict:
     """
     Projects the solved T-DIR blocks into an OWPML (.hwpx) archive using the effective
     `target_spec` (font families, font sizes, page dimensions, margins, preamble blocks,
     and discovered slot geometry) with zero hardcoded font names or domain strings.
+    Supports both template-based and standalone package synthesis ([P2-01]) as well as
+    embedded binary `<hp:pic>` media and `<hp:equation>` script nodes ([P2-02]).
     """
     body_font = target_spec.body_font_family or "sans-serif"
     body_sz_hu = target_spec.body_font_size_hu if target_spec.body_font_size_hu > 0 else 1200
@@ -1194,7 +1242,24 @@ def project_ir_to_hwpx(
         runs_xml: List[str] = []
         for r in p_blk["runs"]:
             cid = get_hwpx_cs(height_hu, r["bold"], r["italic"], bool(r.get("underline", False)), r["color"])
-            runs_xml.append(f'<hp:run charPrIDRef="{cid}"><hp:t>{xml_esc(r["text"])}</hp:t></hp:run>')
+            eq_ast = r.get("equation_ast")
+            txt = strip_illegal_xml_control_chars(str(r.get("text", "")))
+            if eq_ast and not txt:
+                txt = compile_equation_ast_to_linear_text(eq_ast)
+            if eq_ast:
+                id_counter[0] += 1
+                eq_id = id_counter[0] + 60000
+                hwpeqn_str = strip_illegal_xml_control_chars(compile_equation_ast_to_hwpeqn(eq_ast))
+                eq_xml = (
+                    f'<hp:equation id="{eq_id}" version="Equation Version 60" baseLine="85" '
+                    f'textColor="#000000" baseUnit="1000" lineMode="CHAR" font="HYhwpEQ" '
+                    f'script="{xml_esc(hwpeqn_str)}">'
+                    f'<hp:sz width="4000" widthRelTo="ABSOLUTE" height="1200" heightRelTo="ABSOLUTE" protect="0"/>'
+                    f"</hp:equation>"
+                )
+                runs_xml.append(f'<hp:run charPrIDRef="{cid}"><hp:t>{xml_esc(txt)}</hp:t>{eq_xml}</hp:run>')
+            else:
+                runs_xml.append(f'<hp:run charPrIDRef="{cid}"><hp:t>{xml_esc(txt)}</hp:t></hp:run>')
         if not runs_xml:
             runs_xml.append('<hp:run charPrIDRef="0"><hp:t></hp:t></hp:run>')
         return f'<hp:p id="{pid}" paraPrIDRef="{ps_id}" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0">{"".join(runs_xml)}</hp:p>'
@@ -1285,14 +1350,14 @@ def project_ir_to_hwpx(
             f"<hp:tr>"
             f'<hp:tc name="" header="0" hasMargin="1" protect="0" editable="0" dirty="0" borderFillIDRef="3">'
             f'<hp:subList id="" textDirection="HORIZONTAL" lineWrap="BREAK" vertAlign="CENTER" linkListIDRef="0" linkListNextIDRef="0" textWidth="0" textHeight="0" hasTextRef="0" hasNumRef="0">'
-            f'<hp:p id="{pid + 1}" paraPrIDRef="1" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0"><hp:run charPrIDRef="4"><hp:t>{xml_esc(title_left)}</hp:t></hp:run></hp:p>'
+            f'<hp:p id="{pid + 1}" paraPrIDRef="1" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0"><hp:run charPrIDRef="4"><hp:t>{xml_esc(strip_illegal_xml_control_chars(title_left))}</hp:t></hp:run></hp:p>'
             f"</hp:subList>"
             f'<hp:cellAddr colAddr="0" rowAddr="0"/><hp:cellSpan colSpan="1" rowSpan="1"/>'
             f'<hp:cellSz width="{col0_w}" height="{hdr_h}"/><hp:cellMargin left="510" right="510" top="141" bottom="141"/>'
             f"</hp:tc>"
             f'<hp:tc name="" header="0" hasMargin="1" protect="0" editable="0" dirty="0" borderFillIDRef="4">'
             f'<hp:subList id="" textDirection="HORIZONTAL" lineWrap="BREAK" vertAlign="CENTER" linkListIDRef="0" linkListNextIDRef="0" textWidth="0" textHeight="0" hasTextRef="0" hasNumRef="0">'
-            f'<hp:p id="{pid + 2}" paraPrIDRef="1" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0"><hp:run charPrIDRef="5"><hp:t>{xml_esc(subtitle_right)}</hp:t></hp:run></hp:p>'
+            f'<hp:p id="{pid + 2}" paraPrIDRef="1" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0"><hp:run charPrIDRef="5"><hp:t>{xml_esc(strip_illegal_xml_control_chars(subtitle_right))}</hp:t></hp:run></hp:p>'
             f"</hp:subList>"
             f'<hp:cellAddr colAddr="1" rowAddr="0"/><hp:cellSpan colSpan="1" rowSpan="1"/>'
             f'<hp:cellSz width="{col1_w}" height="{hdr_h}"/><hp:cellMargin left="510" right="510" top="141" bottom="141"/>'
@@ -1322,7 +1387,11 @@ def project_ir_to_hwpx(
     mh_hu = target_spec.margin_header_hu if target_spec.margin_header_hu > 0 else 2834
     mf_hu = target_spec.margin_footer_hu if target_spec.margin_footer_hu > 0 else 2834
 
-    preamble_summary = " — ".join(pb["text"] for pb in target_spec.preamble_blocks[:3]) if target_spec.preamble_blocks else ""
+    preamble_summary = (
+        strip_illegal_xml_control_chars(" — ".join(pb["text"] for pb in target_spec.preamble_blocks[:3]))
+        if target_spec.preamble_blocks
+        else ""
+    )
 
     sec_p_list: List[str] = [
         '<hp:p id="1" paraPrIDRef="2" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0">'
@@ -1359,11 +1428,37 @@ def project_ir_to_hwpx(
             )
         )
 
-    for cap in attachment_captions:
+    hwpx_bin_items: List[Tuple[str, str, str, str, bytes, str]] = []
+    if attachments:
+        for idx_a, (img_bytes, cap_str) in enumerate(attachments):
+            ext_str, mime_str = detect_image_format(img_bytes)
+            bin_id = f"image{idx_a + 1}"
+            href = f"BinData/{bin_id}.{ext_str}"
+            hwpx_bin_items.append((bin_id, href, ext_str, mime_str, img_bytes, cap_str))
+
+    for idx_b, (bin_id, _, _, _, _, cap_str) in enumerate(hwpx_bin_items):
+        id_counter[0] += 1
+        pid_b = id_counter[0]
+        pic_id = pid_b + 70000
+        cap_clean = strip_illegal_xml_control_chars(
+            attachment_captions[idx_b] if idx_b < len(attachment_captions) else cap_str
+        )
+        sec_p_list.append(
+            f'<hp:p id="{pid_b}" paraPrIDRef="2" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0">'
+            f'<hp:run charPrIDRef="3">'
+            f'<hp:pic id="{pic_id}" zOrder="0" numberingType="PICTURE" textWrap="TOP_AND_BOTTOM" textFlow="BOTH_SIDES" lock="0" dropcapstyle="None" groupLevel="0" instid="{pic_id}" reverse="0">'
+            f'<hp:sz width="22000" widthRelTo="ABSOLUTE" height="14000" heightRelTo="ABSOLUTE" protect="0"/>'
+            f'<hc:img binaryItemIDRef="{bin_id}" bright="0" contrast="0" effect="REAL_PIC" alpha="0"/>'
+            f"</hp:pic>"
+            f"<hp:t>{xml_esc(cap_clean)}</hp:t>"
+            f"</hp:run></hp:p>"
+        )
+
+    for cap in attachment_captions[len(hwpx_bin_items) :]:
         id_counter[0] += 1
         sec_p_list.append(
             f'<hp:p id="{id_counter[0]}" paraPrIDRef="2" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0">'
-            f'<hp:run charPrIDRef="3"><hp:t>{xml_esc(cap)}</hp:t></hp:run></hp:p>'
+            f'<hp:run charPrIDRef="3"><hp:t>{xml_esc(strip_illegal_xml_control_chars(cap))}</hp:t></hp:run></hp:p>'
         )
 
     section0_xml = (
@@ -1458,6 +1553,14 @@ def project_ir_to_hwpx(
         for lg in langs
     )
 
+    bin_data_xml = ""
+    if hwpx_bin_items:
+        bd_items = "".join(
+            f'<hh:binData id="{idx_a + 1}" type="EMBEDDING" rId="{bin_id}" format="{ext_str}"/>'
+            for idx_a, (bin_id, _, ext_str, _, _, _) in enumerate(hwpx_bin_items)
+        )
+        bin_data_xml = f'<hh:binDataList itemCnt="{len(hwpx_bin_items)}">{bd_items}</hh:binDataList>'
+
     header_xml = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>'
         '<hh:head xmlns:ha="http://www.hancom.co.kr/hwpml/2011/app" '
@@ -1485,6 +1588,7 @@ def project_ir_to_hwpx(
         '<hh:numberings itemCnt="1"><hh:numbering id="1" start="0"><hh:paraHead start="1" level="1" align="LEFT" useInstWidth="1" autoIndent="1" widthAdjust="0" textOffsetType="PERCENT" textOffset="50" numFormat="DIGIT" charPrIDRef="0" checkable="0">^1.</hh:paraHead></hh:numbering></hh:numberings>'
         f'<hh:paraProperties itemCnt="{len(ps_xml_items)}">{"".join(ps_xml_items)}</hh:paraProperties>'
         '<hh:styles itemCnt="1"><hh:style id="0" type="PARA" name="바탕글" engName="Normal" paraPrIDRef="0" charPrIDRef="0" nextStyleIDRef="0" langID="1042" lockForm="0"/></hh:styles>'
+        f"{bin_data_xml}"
         "</hh:refList>"
         '<hh:compatibleDocument targetProgram="HWP201X"><hh:layoutCompatibility/></hh:compatibleDocument>'
         '<hh:docOption><hh:linkinfo path="" pageInherit="0" footnoteInherit="0"/></hh:docOption>'
@@ -1492,19 +1596,97 @@ def project_ir_to_hwpx(
         "</hh:head>"
     )
 
+    opf_bin_items = "".join(
+        f'<opf:item id="{bin_id}" href="{href}" media-type="{mime_str}" isEmbeded="1"/>'
+        for bin_id, href, _, mime_str, _, _ in hwpx_bin_items
+    )
+    content_hpf_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>'
+        '<opf:package xmlns:ha="http://www.hancom.co.kr/hwpml/2011/app" '
+        'xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph" '
+        'xmlns:hp10="http://www.hancom.co.kr/hwpml/2016/paragraph" '
+        'xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section" '
+        'xmlns:hc="http://www.hancom.co.kr/hwpml/2011/core" '
+        'xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head" '
+        'xmlns:hhs="http://www.hancom.co.kr/hwpml/2011/history" '
+        'xmlns:hm="http://www.hancom.co.kr/hwpml/2011/master-page" '
+        'xmlns:hpf="http://www.hancom.co.kr/schema/2011/hpf" '
+        'xmlns:dc="http://purl.org/dc/elements/1.1/" '
+        'xmlns:opf="http://www.idpf.org/2007/opf/" '
+        'version="" unique-identifier="" id="">'
+        '<opf:metadata><opf:title>T-DIR Document</opf:title><opf:language>ko</opf:language></opf:metadata>'
+        "<opf:manifest>"
+        '<opf:item id="header" href="Contents/header.xml" media-type="application/xml"/>'
+        f"{opf_bin_items}"
+        '<opf:item id="section0" href="Contents/section0.xml" media-type="application/xml"/>'
+        '<opf:item id="settings" href="settings.xml" media-type="application/xml"/>'
+        "</opf:manifest>"
+        '<opf:spine><opf:itemref idref="header" linear="yes"/><opf:itemref idref="section0" linear="yes"/></opf:spine>'
+        "</opf:package>"
+    )
+
     os.makedirs(os.path.dirname(os.path.abspath(out_hwpx_path)), exist_ok=True)
-    with zipfile.ZipFile(base_hwpx_path, "r") as zin, zipfile.ZipFile(
-        out_hwpx_path, "w", zipfile.ZIP_DEFLATED
-    ) as zout:
-        for item in zin.infolist():
-            if item.filename == "mimetype":
-                zout.writestr(item, zin.read(item.filename), compress_type=zipfile.ZIP_STORED)
-            elif item.filename == "Contents/header.xml":
-                zout.writestr(item, header_xml.encode("utf-8"))
-            elif item.filename == "Contents/section0.xml":
-                zout.writestr(item, section0_xml.encode("utf-8"))
-            else:
-                zout.writestr(item, zin.read(item.filename))
+    has_valid_base_hwpx = bool(
+        base_hwpx_path and os.path.isfile(base_hwpx_path) and zipfile.is_zipfile(base_hwpx_path)
+    )
+    if has_valid_base_hwpx:
+        assert base_hwpx_path is not None
+        with zipfile.ZipFile(base_hwpx_path, "r") as zin, zipfile.ZipFile(
+            out_hwpx_path, "w", zipfile.ZIP_DEFLATED
+        ) as zout:
+            validate_safe_zip_archive(zin)
+            for item in zin.infolist():
+                if item.filename == "mimetype":
+                    zout.writestr(item, zin.read(item.filename), compress_type=zipfile.ZIP_STORED)
+                elif item.filename == "Contents/header.xml":
+                    zout.writestr(item, header_xml.encode("utf-8"))
+                elif item.filename == "Contents/section0.xml":
+                    zout.writestr(item, section0_xml.encode("utf-8"))
+                elif item.filename == "Contents/content.hpf" and hwpx_bin_items:
+                    zout.writestr(item, content_hpf_xml.encode("utf-8"))
+                else:
+                    zout.writestr(item, zin.read(item.filename))
+            for _, href, _, _, img_bytes, _ in hwpx_bin_items:
+                zout.writestr(f"Contents/{href}", img_bytes)
+    else:
+        version_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>'
+            '<hv:HCFVersion xmlns:hv="http://www.hancom.co.kr/hwpml/2011/version" '
+            'tagetApplication="WORDPROCESSOR" major="5" minor="1" micro="0" buildNumber="1" '
+            'os="1" xmlVersion="1.4" application="Hancom Office Hangul" appVersion="11.0.0.0"/>'
+        )
+        settings_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>'
+            '<ha:HWPApplicationSetting xmlns:ha="http://www.hancom.co.kr/hwpml/2011/app" '
+            'xmlns:config="urn:oasis:names:tc:opendocument:xmlns:config:1.0">'
+            '<ha:CaretPosition listIDRef="0" paraIDRef="0" pos="0"/>'
+            "</ha:HWPApplicationSetting>"
+        )
+        container_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>'
+            '<ocf:container xmlns:ocf="urn:oasis:names:tc:opendocument:xmlns:container" '
+            'xmlns:hpf="http://www.hancom.co.kr/schema/2011/hpf">'
+            "<ocf:rootfiles>"
+            '<ocf:rootfile full-path="Contents/content.hpf" media-type="application/hwpml-package+xml"/>'
+            "</ocf:rootfiles>"
+            "</ocf:container>"
+        )
+        manifest_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>'
+            '<odf:manifest xmlns:odf="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0"/>'
+        )
+        with zipfile.ZipFile(out_hwpx_path, "w", zipfile.ZIP_DEFLATED) as zout:
+            zout.writestr("mimetype", b"application/hwp+zip", compress_type=zipfile.ZIP_STORED)
+            zout.writestr("version.xml", version_xml.encode("utf-8"))
+            zout.writestr("settings.xml", settings_xml.encode("utf-8"))
+            zout.writestr("META-INF/container.xml", container_xml.encode("utf-8"))
+            zout.writestr("META-INF/manifest.xml", manifest_xml.encode("utf-8"))
+            zout.writestr("Preview/PrvText.txt", preamble_summary.encode("utf-8"))
+            zout.writestr("Contents/content.hpf", content_hpf_xml.encode("utf-8"))
+            zout.writestr("Contents/header.xml", header_xml.encode("utf-8"))
+            zout.writestr("Contents/section0.xml", section0_xml.encode("utf-8"))
+            for _, href, _, _, img_bytes, _ in hwpx_bin_items:
+                zout.writestr(f"Contents/{href}", img_bytes)
 
     return {
         "out_hwpx_path": out_hwpx_path,
@@ -1512,4 +1694,346 @@ def project_ir_to_hwpx(
         "effective_body_font": body_font,
         "effective_body_size_hu": body_sz_hu,
         "effective_table_size_hu": tbl_sz_hu,
+        "standalone_synthesized": not has_valid_base_hwpx,
+        "embedded_images_count": len(hwpx_bin_items),
     }
+
+
+def scan_hwpx_source_spec(hwpx_path: str) -> SourceDocumentSpecIR:
+    """
+    Dynamically inspects an OWPML (.hwpx) archive (`Contents/header.xml` and `Contents/section0.xml`)
+    to extract page geometry, margins, font families, and font sizes ([P2-01]).
+    """
+    spec = SourceDocumentSpecIR(source_path=hwpx_path, source_format="HWPX_OWPML")
+    with zipfile.ZipFile(hwpx_path, "r") as zf:
+        validate_safe_zip_archive(zf)
+        if "Contents/header.xml" in zf.namelist():
+            hdr_root = safe_parse_xml_bytes(zf.read("Contents/header.xml"))
+            for f_el in hdr_root.findall(f".//{{{HH_NS}}}font"):
+                face = f_el.get("face", "")
+                if face:
+                    spec.body_font_family = face
+                    spec.table_font_family = face
+                    break
+            heights: List[int] = []
+            for cp_el in hdr_root.findall(f".//{{{HH_NS}}}charPr"):
+                h_val = int(cp_el.get("height", "0") or 0)
+                if 700 <= h_val <= 1600:
+                    heights.append(h_val)
+            if heights:
+                spec.body_font_size_hu = heights[0]
+                spec.table_font_size_hu = min(heights)
+        if "Contents/section0.xml" in zf.namelist():
+            sec_root = safe_parse_xml_bytes(zf.read("Contents/section0.xml"))
+            pg_pr = sec_root.find(f".//{{{HP_NS}}}pagePr")
+            if pg_pr is not None:
+                w_hu = int(pg_pr.get("width", "0") or 0)
+                h_hu = int(pg_pr.get("height", "0") or 0)
+                if w_hu > 0:
+                    spec.page_width_hu = w_hu
+                if h_hu > 0:
+                    spec.page_height_hu = h_hu
+                mar_el = pg_pr.find(f"{{{HP_NS}}}margin")
+                if mar_el is not None:
+                    spec.margin_left_hu = int(mar_el.get("left", "0") or 0) or None
+                    spec.margin_right_hu = int(mar_el.get("right", "0") or 0) or None
+                    spec.margin_top_hu = int(mar_el.get("top", "0") or 0) or None
+                    spec.margin_bottom_hu = int(mar_el.get("bottom", "0") or 0) or None
+    return spec
+
+
+def lift_hwpx_to_ir(
+    hwpx_path: str,
+    target_width_hu: int = 0,
+    table_font_size_hu: int = 1000,
+) -> Dict[str, SectionIR]:
+    """
+    Lifts an OWPML (.hwpx) archive (`Contents/header.xml`, `Contents/section0.xml..sectionN.xml`,
+    `Contents/content.hpf`, and `Contents/BinData/*`) into canonical `SectionIR` objects ([P2-01], [P2-02]).
+    Supports both 2x2 outer section slot containers and free-form HWPX documents with inner tables,
+    `<hp:equation>` formulas, and `<hp:pic>` binary images.
+    """
+    sections: Dict[str, SectionIR] = {}
+    with zipfile.ZipFile(hwpx_path, "r") as zf:
+        validate_safe_zip_archive(zf)
+        char_pr_map: Dict[str, Tuple[int, bool, bool, bool, str]] = {}
+        para_pr_map: Dict[str, str] = {}
+        bf_fill_map: Dict[str, Optional[str]] = {}
+        bin_href_map: Dict[str, Tuple[str, str]] = {}
+
+        if "Contents/content.hpf" in zf.namelist():
+            hpf_root = safe_parse_xml_bytes(zf.read("Contents/content.hpf"))
+            for item_el in hpf_root.findall(f".//{{{OPF_NS}}}item"):
+                iid = item_el.get("id", "")
+                href = item_el.get("href", "")
+                mtype = item_el.get("media-type", "image/png")
+                if iid and href:
+                    bin_href_map[iid] = (href, mtype)
+
+        if "Contents/header.xml" in zf.namelist():
+            hdr_root = safe_parse_xml_bytes(zf.read("Contents/header.xml"))
+            for cp_el in hdr_root.findall(f".//{{{HH_NS}}}charPr"):
+                cid = cp_el.get("id", "")
+                h_hu = int(cp_el.get("height", "1000") or 1000)
+                col_hex = cp_el.get("textColor", "#000000").lstrip("#").upper()
+                b_flag = cp_el.find(f"{{{HH_NS}}}bold") is not None
+                i_flag = cp_el.find(f"{{{HH_NS}}}italic") is not None
+                u_el = cp_el.find(f"{{{HH_NS}}}underline")
+                u_flag = u_el is not None and u_el.get("type", "NONE") != "NONE"
+                char_pr_map[cid] = (h_hu, b_flag, i_flag, u_flag, col_hex)
+            for pp_el in hdr_root.findall(f".//{{{HH_NS}}}paraPr"):
+                pid = pp_el.get("id", "")
+                al_el = pp_el.find(f"{{{HH_NS}}}align")
+                h_al = al_el.get("horizontal", "JUSTIFY") if al_el is not None else "JUSTIFY"
+                para_pr_map[pid] = {"JUSTIFY": "both", "LEFT": "left", "CENTER": "center", "RIGHT": "right"}.get(
+                    h_al, "both"
+                )
+            for bf_el in hdr_root.findall(f".//{{{HH_NS}}}borderFill"):
+                bf_id = bf_el.get("id", "")
+                wb_el = bf_el.find(f".//{{{HC_NS}}}winBrush")
+                if wb_el is not None:
+                    fc = wb_el.get("faceColor", "").lstrip("#").upper()
+                    if fc and fc != "NONE":
+                        bf_fill_map[bf_id] = fc
+
+        def _parse_hwpx_p(p_el: ET.Element) -> Tuple[dict, List[MediaObjectIR]]:
+            ps_ref = p_el.get("paraPrIDRef", "0")
+            jc = para_pr_map.get(ps_ref, "both")
+            runs: List[dict] = []
+            media_list: List[MediaObjectIR] = []
+            max_sz = 1000
+            for r_el in p_el.findall(f"{{{HP_NS}}}run"):
+                cid = r_el.get("charPrIDRef", "0")
+                h_hu, b_flag, i_flag, u_flag, col_hex = char_pr_map.get(cid, (1000, False, False, False, "000000"))
+                max_sz = max(max_sz, h_hu)
+                eq_el = r_el.find(f"{{{HP_NS}}}equation")
+                eq_ast: Optional[dict] = None
+                if eq_el is not None:
+                    script_str = eq_el.get("script", "")
+                    if not script_str:
+                        sc_child = eq_el.find(f"{{{HP_NS}}}script")
+                        if sc_child is not None and sc_child.text:
+                            script_str = sc_child.text
+                    if script_str:
+                        eq_ast = parse_hwpeqn_to_equation_ast(script_str)
+
+                t_texts = [t_el.text for t_el in r_el.findall(f"{{{HP_NS}}}t") if t_el.text]
+                txt = strip_illegal_xml_control_chars("".join(t_texts))
+                if eq_ast and not txt:
+                    txt = compile_equation_ast_to_linear_text(eq_ast)
+                if txt:
+                    r_dict: dict = {
+                        "text": txt,
+                        "bold": b_flag,
+                        "italic": i_flag,
+                        "underline": u_flag,
+                        "color": col_hex,
+                    }
+                    if eq_ast:
+                        r_dict["equation_ast"] = eq_ast
+                    runs.append(r_dict)
+
+                for pic_el in r_el.findall(f"{{{HP_NS}}}pic"):
+                    img_el = pic_el.find(f".//{{{HC_NS}}}img")
+                    if img_el is not None:
+                        bin_ref = img_el.get("binaryItemIDRef", "")
+                        if bin_ref and bin_ref in bin_href_map:
+                            rel_href, mime_t = bin_href_map[bin_ref]
+                            safe_href = sanitize_archive_rel_path(rel_href)
+                            cand_paths = [f"Contents/{safe_href}", safe_href]
+                            for cp in cand_paths:
+                                if cp in zf.namelist():
+                                    raw_img = zf.read(cp)
+                                    _, det_mime = detect_image_format(raw_img)
+                                    media_list.append(
+                                        MediaObjectIR(
+                                            media_uid=f"HWPX_IMG_{bin_ref}",
+                                            rel_id=bin_ref,
+                                            filename=os.path.basename(cp),
+                                            mime_type=det_mime or mime_t,
+                                            raw_bytes=raw_img,
+                                            caption_hint=txt,
+                                        )
+                                    )
+                                    break
+
+            return (
+                {
+                    "type": "p",
+                    "jc": jc,
+                    "left_tw": 0,
+                    "right_tw": 0,
+                    "indent_tw": 0,
+                    "before_tw": 0,
+                    "after_tw": 8,
+                    "runs": runs,
+                    "r_embed": None,
+                    "max_sz_hu": max_sz,
+                },
+                media_list,
+            )
+
+        def _parse_hwpx_tbl(tbl_el: ET.Element) -> dict:
+            n_rows = int(tbl_el.get("rowCnt", "1") or 1)
+            n_cols = int(tbl_el.get("colCnt", "1") or 1)
+            sz_el = tbl_el.find(f"{{{HP_NS}}}sz")
+            w_tbl = int(sz_el.get("width", "44500") or 44500) if sz_el is not None else (target_width_hu or 44500)
+            h_tbl = int(sz_el.get("height", "4000") or 4000) if sz_el is not None else 4000
+            cells: List[dict] = []
+            col_widths_map: Dict[int, int] = {}
+            row_cols: List[int] = []
+            for tr_el in tbl_el.findall(f"{{{HP_NS}}}tr"):
+                tcs = tr_el.findall(f"{{{HP_NS}}}tc")
+                row_cols.append(len(tcs))
+                for tc_el in tcs:
+                    bf_ref = tc_el.get("borderFillIDRef", "")
+                    fill_hex = bf_fill_map.get(bf_ref)
+                    addr_el = tc_el.find(f"{{{HP_NS}}}cellAddr")
+                    span_el = tc_el.find(f"{{{HP_NS}}}cellSpan")
+                    csz_el = tc_el.find(f"{{{HP_NS}}}cellSz")
+                    cmar_el = tc_el.find(f"{{{HP_NS}}}cellMargin")
+                    c_col = int(addr_el.get("colAddr", "0") or 0) if addr_el is not None else 0
+                    c_row = int(addr_el.get("rowAddr", "0") or 0) if addr_el is not None else 0
+                    c_span = int(span_el.get("colSpan", "1") or 1) if span_el is not None else 1
+                    r_span = int(span_el.get("rowSpan", "1") or 1) if span_el is not None else 1
+                    cw_hu = int(csz_el.get("width", str(w_tbl // max(1, n_cols))) or 4000) if csz_el is not None else 4000
+                    ch_hu = int(csz_el.get("height", "1800") or 1800) if csz_el is not None else 1800
+                    if c_span == 1 and c_col not in col_widths_map:
+                        col_widths_map[c_col] = cw_hu
+                    mar_4 = (140, 140, 35, 35)
+                    if cmar_el is not None:
+                        mar_4 = (
+                            int(cmar_el.get("left", "140") or 140),
+                            int(cmar_el.get("right", "140") or 140),
+                            int(cmar_el.get("top", "35") or 35),
+                            int(cmar_el.get("bottom", "35") or 35),
+                        )
+                    sub_el = tc_el.find(f"{{{HP_NS}}}subList")
+                    cell_paras: List[dict] = []
+                    if sub_el is not None:
+                        for sp_el in sub_el.findall(f"{{{HP_NS}}}p"):
+                            p_dict, _ = _parse_hwpx_p(sp_el)
+                            if p_dict["runs"]:
+                                cell_paras.append(p_dict)
+                    if not cell_paras:
+                        cell_paras.append(
+                            {"type": "p", "jc": "left", "left_tw": 0, "right_tw": 0, "indent_tw": 0, "before_tw": 0, "after_tw": 0, "runs": []}
+                        )
+                    cells.append(
+                        {
+                            "row": c_row,
+                            "col": c_col,
+                            "row_span": r_span,
+                            "col_span": c_span,
+                            "width_hu": cw_hu,
+                            "height_hu": ch_hu,
+                            "mar": mar_4,
+                            "borders": {
+                                s: (1, 1, (0xCB, 0xD5, 0xE1)) for s in ("left", "right", "top", "bottom")
+                            },
+                            "fill_hex": fill_hex,
+                            "paras": cell_paras,
+                        }
+                    )
+            col_widths_hu = [col_widths_map.get(c_i, w_tbl // max(1, n_cols)) for c_i in range(n_cols)]
+            return {
+                "type": "tbl",
+                "n_rows": n_rows,
+                "n_cols": n_cols,
+                "width_hu": sum(col_widths_hu),
+                "height_hu": h_tbl,
+                "col_widths_hu": col_widths_hu,
+                "row_cols": row_cols,
+                "cells": cells,
+            }
+
+        sec_files = sorted(
+            (nm for nm in zf.namelist() if nm.startswith("Contents/section") and nm.endswith(".xml")),
+            key=lambda x: int(x[16:-4]) if x[16:-4].isdigit() else 0,
+        )
+        sec_counter = 0
+        free_blocks: List[dict] = []
+        free_media: List[MediaObjectIR] = []
+
+        for sf in sec_files:
+            sec_root = safe_parse_xml_bytes(zf.read(sf))
+            top_ps = sec_root.findall(f"{{{HP_NS}}}p")
+            for idx_p, top_p in enumerate(top_ps):
+                outer_tbl = top_p.find(f".//{{{HP_NS}}}tbl")
+                if (
+                    outer_tbl is not None
+                    and outer_tbl.get("rowCnt") == "2"
+                    and outer_tbl.get("colCnt") == "2"
+                ):
+                    trs = outer_tbl.findall(f"{{{HP_NS}}}tr")
+                    if len(trs) == 2:
+                        r0_tcs = trs[0].findall(f"{{{HP_NS}}}tc")
+                        r1_tcs = trs[1].findall(f"{{{HP_NS}}}tc")
+                        if len(r0_tcs) == 2 and len(r1_tcs) == 1:
+                            title_txt = "".join(r0_tcs[0].itertext()).strip()
+                            sub_txt = "".join(r0_tcs[1].itertext()).strip()
+                            body_sub = r1_tcs[0].find(f"{{{HP_NS}}}subList")
+                            sec_blks: List[dict] = []
+                            sec_med: List[MediaObjectIR] = []
+                            if body_sub is not None:
+                                for bp_el in body_sub.findall(f"{{{HP_NS}}}p"):
+                                    inner_tbl = bp_el.find(f"{{{HP_NS}}}run/{{{HP_NS}}}tbl")
+                                    if inner_tbl is not None:
+                                        sec_blks.append(_parse_hwpx_tbl(inner_tbl))
+                                    else:
+                                        p_dict, m_list = _parse_hwpx_p(bp_el)
+                                        if p_dict["runs"]:
+                                            sec_blks.append(p_dict)
+                                        sec_med.extend(m_list)
+                            sec_counter += 1
+                            sec_uid = f"SEC_{sec_counter:02d}"
+                            _, n_chars, sha = extract_ir_non_ws_text(sec_blks)
+                            sections[sec_uid] = SectionIR(
+                                section_uid=sec_uid,
+                                heading_text=title_txt or sec_uid,
+                                subtitle_text=sub_txt,
+                                blocks=sec_blks,
+                                media_objects=sec_med,
+                                non_ws_char_count=n_chars,
+                                text_sha256=sha,
+                                ordinal_index=extract_ordinal_index(title_txt) or sec_counter,
+                                section_role="BODY",
+                            )
+                            continue
+
+                if outer_tbl is not None:
+                    free_blocks.append(_parse_hwpx_tbl(outer_tbl))
+                else:
+                    p_dict, m_list = _parse_hwpx_p(top_p)
+                    free_media.extend(m_list)
+                    has_sec_pr = top_p.find(f".//{{{HP_NS}}}secPr") is not None
+                    if has_sec_pr and idx_p == 0 and any(
+                        tp.find(f".//{{{HP_NS}}}tbl") is not None
+                        and tp.find(f".//{{{HP_NS}}}tbl").get("rowCnt") == "2"  # type: ignore[union-attr]
+                        for tp in top_ps[1:]
+                    ):
+                        continue
+                    if p_dict["runs"] and not m_list:
+                        free_blocks.append(p_dict)
+
+        if free_blocks or free_media:
+            if not sections:
+                sec_uid = "SEC_01"
+                _, n_chars, sha = extract_ir_non_ws_text(free_blocks)
+                sections[sec_uid] = SectionIR(
+                    section_uid=sec_uid,
+                    heading_text="HWPX Section 1",
+                    subtitle_text="",
+                    blocks=free_blocks,
+                    media_objects=free_media,
+                    non_ws_char_count=n_chars,
+                    text_sha256=sha,
+                    ordinal_index=1,
+                    section_role="BODY",
+                )
+            elif free_media:
+                first_key = sorted(sections.keys())[0]
+                sections[first_key].media_objects.extend(free_media)
+
+    return sections
+

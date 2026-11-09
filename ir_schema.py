@@ -8,12 +8,143 @@ Zero hardcoded font names, pixel/HWPUNIT constants, or document-specific section
   3. SourceDocumentSpecIR (Dynamically extracted from source document file)
 """
 
+import os
 import re
 import copy
 import hashlib
+import zipfile
 import unicodedata
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Union
+
+M_OMML_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
+ET.register_namespace("m", M_OMML_NS)
+
+_WINDOWS_RESERVED_DEVICES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    "COM1",
+    "COM2",
+    "COM3",
+    "COM4",
+    "COM5",
+    "COM6",
+    "COM7",
+    "COM8",
+    "COM9",
+    "LPT1",
+    "LPT2",
+    "LPT3",
+    "LPT4",
+    "LPT5",
+    "LPT6",
+    "LPT7",
+    "LPT8",
+    "LPT9",
+}
+
+
+def strip_illegal_xml_control_chars(text: str) -> str:
+    """
+    Strips XML 1.0 illegal control characters (0x00..0x08, 0x0B, 0x0C, 0x0E..0x1F, 0xFFFE, 0xFFFF)
+    while preserving 100% of valid whitespace (\t, \n, \r) and printable Unicode characters ([SEC-05]).
+    """
+    if not text:
+        return ""
+    return "".join(
+        ch
+        for ch in text
+        if (ord(ch) >= 0x20 and ord(ch) not in (0xFFFE, 0xFFFF)) or ch in ("\t", "\n", "\r")
+    )
+
+
+def validate_safe_filesystem_path(path_str: str, must_exist: bool = False) -> str:
+    """
+    Validates a local filesystem path against null-byte injection and Windows reserved device names ([SEC-04]).
+    """
+    if not path_str or "\x00" in path_str:
+        raise ValueError("Invalid filesystem path: empty or contains null byte.")
+    norm_p = os.path.abspath(path_str)
+    base_stem = os.path.splitext(os.path.basename(norm_p))[0].upper()
+    if base_stem in _WINDOWS_RESERVED_DEVICES:
+        raise ValueError(f"Rejected reserved device filename: {base_stem}")
+    if must_exist and not os.path.exists(norm_p):
+        raise FileNotFoundError(f"Required file does not exist: {norm_p}")
+    return norm_p
+
+
+def sanitize_archive_rel_path(rel_target: str) -> str:
+    """
+    Sanitizes an internal ZIP archive relationship path and rejects path traversal ('..') or drive prefixes ([SEC-02]).
+    """
+    cleaned = rel_target.replace("\\", "/").lstrip("/")
+    parts = [p for p in cleaned.split("/") if p and p != "."]
+    if any(p == ".." or ":" in p for p in parts):
+        raise ValueError(f"Blocked archive path traversal in relationship target: {rel_target}")
+    return "/".join(parts)
+
+
+def validate_safe_zip_archive(
+    zf_or_path: Union[zipfile.ZipFile, str],
+    max_entries: int = 4096,
+    max_single_bytes: int = 67108864,
+    max_total_bytes: int = 268435456,
+) -> None:
+    """
+    Validates a ZIP archive (.docx, .hwpx, .xlsx) against Zip-Slip path traversal and ZIP decompression bombs ([SEC-02]).
+    """
+    if isinstance(zf_or_path, str):
+        with zipfile.ZipFile(zf_or_path, "r") as zf_opened:
+            validate_safe_zip_archive(
+                zf_opened,
+                max_entries=max_entries,
+                max_single_bytes=max_single_bytes,
+                max_total_bytes=max_total_bytes,
+            )
+        return
+    infos = zf_or_path.infolist()
+    if len(infos) > max_entries:
+        raise ValueError(f"ZIP archive entry count ({len(infos)}) exceeds safety limit ({max_entries}).")
+    total_uncompressed = 0
+    for info in infos:
+        fname = info.filename.replace("\\", "/")
+        parts = [p for p in fname.split("/") if p]
+        if fname.startswith("/") or any(p == ".." or ":" in p for p in parts):
+            raise ValueError(f"Blocked Zip-Slip path traversal entry: {info.filename}")
+        if info.file_size > max_single_bytes:
+            raise ValueError(f"ZIP entry '{info.filename}' uncompressed size ({info.file_size}) exceeds limit.")
+        total_uncompressed += info.file_size
+        if total_uncompressed > max_total_bytes:
+            raise ValueError(f"ZIP archive total uncompressed size ({total_uncompressed}) exceeds limit.")
+
+
+def safe_parse_xml_bytes(xml_bytes: bytes, max_xml_bytes: int = 67108864) -> ET.Element:
+    """
+    Parses XML bytes after enforcing size limits and rejecting DOCTYPE / ENTITY declarations
+    to prevent XML External Entity (XXE) and Billion Laughs entity expansion attacks ([SEC-01]).
+    """
+    if len(xml_bytes) > max_xml_bytes:
+        raise ValueError(f"XML payload size ({len(xml_bytes)} B) exceeds safety limit ({max_xml_bytes} B).")
+    head_sample = xml_bytes[:16384].upper()
+    if b"<!DOCTYPE" in head_sample or b"<!ENTITY" in head_sample:
+        raise ValueError("Rejected XML containing DOCTYPE or ENTITY declarations (XXE / Entity Bomb guard).")
+    return ET.fromstring(xml_bytes)
+
+
+def sanitize_spreadsheet_cell_formula(text: str, neutralize_dde: bool = True) -> str:
+    """
+    Guards against DDE / command execution payloads in spreadsheet cells while preserving normal numeric/text cells ([SEC-05]).
+    """
+    cleaned = strip_illegal_xml_control_chars(text)
+    if not neutralize_dde or not cleaned:
+        return cleaned
+    stripped = cleaned.lstrip()
+    if stripped.startswith(("=", "+", "-", "@")) and ("|" in stripped or "CMD" in stripped.upper() or "MSEXCEL" in stripped.upper()):
+        return "'" + cleaned
+    return cleaned
 
 
 def pt_to_hu(pt_val: float) -> int:
@@ -280,6 +411,7 @@ class TextRunIR:
     italic: bool = False
     underline: bool = False
     color_hex: str = "000000"
+    equation_ast: Optional[dict] = None
 
 
 @dataclass
@@ -694,3 +826,505 @@ def validate_text_immutability(source_blocks: List[dict], output_text: str) -> d
         "substring_contained": is_substring_match,
         "lost_chars": max(0, src_len - out_len) if not is_substring_match else 0,
     }
+
+
+# ==============================================================================
+# 5. 3-Way Isomorphic Equation AST Compiler ([P2-02]: OMML <-> HWP EQN <-> LaTeX)
+# ==============================================================================
+
+NS_OMML = "http://schemas.openxmlformats.org/officeDocument/2006/math"
+
+_LATEX_TO_UNICODE_SYM: Dict[str, str] = {
+    r"\alpha": "α",
+    r"\beta": "β",
+    r"\gamma": "γ",
+    r"\delta": "δ",
+    r"\epsilon": "ϵ",
+    r"\theta": "θ",
+    r"\lambda": "λ",
+    r"\mu": "μ",
+    r"\pi": "π",
+    r"\rho": "ρ",
+    r"\sigma": "σ",
+    r"\tau": "τ",
+    r"\phi": "ϕ",
+    r"\omega": "ω",
+    r"\Delta": "Δ",
+    r"\Sigma": "Σ",
+    r"\Omega": "Ω",
+    r"\pm": "±",
+    r"\times": "×",
+    r"\div": "÷",
+    r"\cdot": "·",
+    r"\le": "≤",
+    r"\ge": "≥",
+    r"\ne": "≠",
+    r"\approx": "≈",
+    r"\to": "→",
+    r"\infty": "∞",
+    r"\sum": "∑",
+    r"\prod": "∏",
+    r"\int": "∫",
+    r"\partial": "∂",
+}
+
+_UNICODE_TO_LATEX_SYM: Dict[str, str] = {v: k for k, v in _LATEX_TO_UNICODE_SYM.items()}
+
+_HWPEQN_TO_UNICODE_SYM: Dict[str, str] = {
+    "alpha": "α",
+    "beta": "β",
+    "gamma": "γ",
+    "delta": "δ",
+    "epsilon": "ϵ",
+    "theta": "θ",
+    "lambda": "λ",
+    "mu": "μ",
+    "pi": "π",
+    "rho": "ρ",
+    "sigma": "σ",
+    "tau": "τ",
+    "phi": "ϕ",
+    "omega": "ω",
+    "DELTA": "Δ",
+    "SIGMA": "Σ",
+    "OMEGA": "Ω",
+    "+-": "±",
+    "times": "×",
+    "div": "÷",
+    "cdot": "·",
+    "<=": "≤",
+    ">=": "≥",
+    "!=": "≠",
+    "approx": "≈",
+    "->": "→",
+    "inf": "∞",
+    "sum": "∑",
+    "prod": "∏",
+    "int": "∫",
+    "partial": "∂",
+}
+
+_UNICODE_TO_HWPEQN_SYM: Dict[str, str] = {v: k for k, v in _HWPEQN_TO_UNICODE_SYM.items()}
+
+
+def normalize_equation_ast(node: dict) -> dict:
+    if not isinstance(node, dict):
+        return {"kind": "sym", "val": str(node)}
+    kind = node.get("kind", "sym")
+    if kind == "sym":
+        return {"kind": "sym", "val": str(node.get("val", "")).strip()}
+    if kind == "seq":
+        flat: List[dict] = []
+        for item in node.get("items", []):
+            norm_item = normalize_equation_ast(item)
+            if norm_item.get("kind") == "seq":
+                flat.extend(norm_item.get("items", []))
+            elif norm_item.get("kind") == "sym" and not norm_item.get("val"):
+                continue
+            else:
+                flat.append(norm_item)
+        if len(flat) == 1:
+            return flat[0]
+        return {"kind": "seq", "items": flat}
+    if kind == "frac":
+        return {
+            "kind": "frac",
+            "num": normalize_equation_ast(node.get("num", {"kind": "sym", "val": "1"})),
+            "den": normalize_equation_ast(node.get("den", {"kind": "sym", "val": "1"})),
+        }
+    if kind == "sqrt":
+        return {
+            "kind": "sqrt",
+            "body": normalize_equation_ast(node.get("body", {"kind": "sym", "val": "x"})),
+        }
+    if kind == "sup":
+        return {
+            "kind": "sup",
+            "base": normalize_equation_ast(node.get("base", {"kind": "sym", "val": "x"})),
+            "exp": normalize_equation_ast(node.get("exp", {"kind": "sym", "val": "2"})),
+        }
+    if kind == "sub":
+        return {
+            "kind": "sub",
+            "base": normalize_equation_ast(node.get("base", {"kind": "sym", "val": "x"})),
+            "sub": normalize_equation_ast(node.get("sub", {"kind": "sym", "val": "i"})),
+        }
+    if kind == "subsup":
+        return {
+            "kind": "subsup",
+            "base": normalize_equation_ast(node.get("base", {"kind": "sym", "val": "x"})),
+            "sub": normalize_equation_ast(node.get("sub", {"kind": "sym", "val": "i"})),
+            "exp": normalize_equation_ast(node.get("exp", {"kind": "sym", "val": "2"})),
+        }
+    return {"kind": "sym", "val": str(node.get("val", ""))}
+
+
+def _extract_braced_group(text: str, pos: int) -> Tuple[str, int]:
+    while pos < len(text) and text[pos].isspace():
+        pos += 1
+    if pos >= len(text):
+        return "", pos
+    if text[pos] != "{":
+        return text[pos], pos + 1
+    depth = 0
+    start = pos + 1
+    i = pos
+    while i < len(text):
+        ch = text[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i], i + 1
+        i += 1
+    return text[start:], len(text)
+
+
+def parse_latex_to_equation_ast(latex_str: str) -> dict:
+    s = latex_str.strip()
+    if s.startswith("$$") and s.endswith("$$") and len(s) >= 4:
+        s = s[2:-2].strip()
+    elif s.startswith("$") and s.endswith("$") and len(s) >= 2:
+        s = s[1:-1].strip()
+
+    items: List[dict] = []
+    i = 0
+    n = len(s)
+    while i < n:
+        if s[i].isspace():
+            i += 1
+            continue
+        if s.startswith(r"\frac", i):
+            i += 5
+            num_str, i = _extract_braced_group(s, i)
+            den_str, i = _extract_braced_group(s, i)
+            items.append({
+                "kind": "frac",
+                "num": parse_latex_to_equation_ast(num_str),
+                "den": parse_latex_to_equation_ast(den_str),
+            })
+            continue
+        if s.startswith(r"\sqrt", i):
+            i += 5
+            body_str, i = _extract_braced_group(s, i)
+            items.append({
+                "kind": "sqrt",
+                "body": parse_latex_to_equation_ast(body_str),
+            })
+            continue
+        if s[i] == "{":
+            grp_str, i = _extract_braced_group(s, i)
+            items.append(parse_latex_to_equation_ast(grp_str))
+            continue
+        if s[i] in ("_", "^") and items:
+            base_node = items.pop()
+            sub_node: Optional[dict] = None
+            exp_node: Optional[dict] = None
+            for _ in range(2):
+                while i < n and s[i].isspace():
+                    i += 1
+                if i < n and s[i] == "_":
+                    i += 1
+                    sub_str, i = _extract_braced_group(s, i)
+                    sub_node = parse_latex_to_equation_ast(sub_str)
+                elif i < n and s[i] == "^":
+                    i += 1
+                    exp_str, i = _extract_braced_group(s, i)
+                    exp_node = parse_latex_to_equation_ast(exp_str)
+                else:
+                    break
+            if sub_node is not None and exp_node is not None:
+                items.append({"kind": "subsup", "base": base_node, "sub": sub_node, "exp": exp_node})
+            elif sub_node is not None:
+                items.append({"kind": "sub", "base": base_node, "sub": sub_node})
+            elif exp_node is not None:
+                items.append({"kind": "sup", "base": base_node, "exp": exp_node})
+            continue
+        if s[i] == "\\":
+            j = i + 1
+            while j < n and s[j].isalpha():
+                j += 1
+            cmd = s[i:j]
+            sym_val = _LATEX_TO_UNICODE_SYM.get(cmd, cmd.lstrip("\\"))
+            items.append({"kind": "sym", "val": sym_val})
+            i = j
+            continue
+        if s[i].isdigit() or s[i].isalpha():
+            j = i + 1
+            while j < n and (s[j].isdigit() or (s[i].isdigit() and s[j] == ".")):
+                j += 1
+            items.append({"kind": "sym", "val": s[i:j]})
+            i = j
+            continue
+        items.append({"kind": "sym", "val": s[i]})
+        i += 1
+
+    return normalize_equation_ast({"kind": "seq", "items": items})
+
+
+def _tokenize_hwpeqn(eqn_str: str) -> List[Union[str, Tuple[str, str]]]:
+    tokens: List[Union[str, Tuple[str, str]]] = []
+    i = 0
+    n = len(eqn_str)
+    while i < n:
+        if eqn_str[i].isspace() or eqn_str[i] == "~":
+            i += 1
+            continue
+        if eqn_str[i] == "{":
+            grp_str, i = _extract_braced_group(eqn_str, i)
+            tokens.append(("GROUP", grp_str))
+            continue
+        for two_op in ("+-", "<=", ">=", "!=", "->"):
+            if eqn_str.startswith(two_op, i):
+                tokens.append(two_op)
+                i += len(two_op)
+                break
+        else:
+            if eqn_str[i].isalpha():
+                j = i + 1
+                while j < n and eqn_str[j].isalpha():
+                    j += 1
+                tokens.append(eqn_str[i:j])
+                i = j
+            elif eqn_str[i].isdigit():
+                j = i + 1
+                while j < n and (eqn_str[j].isdigit() or eqn_str[j] == "."):
+                    j += 1
+                tokens.append(eqn_str[i:j])
+                i = j
+            else:
+                tokens.append(eqn_str[i])
+                i += 1
+    return tokens
+
+
+def parse_hwpeqn_to_equation_ast(eqn_str: str) -> dict:
+    raw_tokens = _tokenize_hwpeqn(eqn_str.strip())
+    items: List[dict] = []
+    idx = 0
+    total = len(raw_tokens)
+
+    def _tok_to_ast(tok: Union[str, Tuple[str, str]]) -> dict:
+        if isinstance(tok, tuple) and tok[0] == "GROUP":
+            return parse_hwpeqn_to_equation_ast(tok[1])
+        s_tok = str(tok)
+        return {"kind": "sym", "val": _HWPEQN_TO_UNICODE_SYM.get(s_tok, s_tok)}
+
+    while idx < total:
+        tok = raw_tokens[idx]
+        if tok == "sqrt" and idx + 1 < total:
+            body_ast = _tok_to_ast(raw_tokens[idx + 1])
+            items.append({"kind": "sqrt", "body": body_ast})
+            idx += 2
+            continue
+        if tok in ("_", "^") and items and idx + 1 < total:
+            base_node = items.pop()
+            sub_node: Optional[dict] = None
+            exp_node: Optional[dict] = None
+            for _ in range(2):
+                if idx < total and raw_tokens[idx] == "_" and idx + 1 < total:
+                    sub_node = _tok_to_ast(raw_tokens[idx + 1])
+                    idx += 2
+                elif idx < total and raw_tokens[idx] == "^" and idx + 1 < total:
+                    exp_node = _tok_to_ast(raw_tokens[idx + 1])
+                    idx += 2
+                else:
+                    break
+            if sub_node is not None and exp_node is not None:
+                items.append({"kind": "subsup", "base": base_node, "sub": sub_node, "exp": exp_node})
+            elif sub_node is not None:
+                items.append({"kind": "sub", "base": base_node, "sub": sub_node})
+            elif exp_node is not None:
+                items.append({"kind": "sup", "base": base_node, "exp": exp_node})
+            continue
+        if tok == "over" and items and idx + 1 < total:
+            num_node = items.pop()
+            den_node = _tok_to_ast(raw_tokens[idx + 1])
+            items.append({"kind": "frac", "num": num_node, "den": den_node})
+            idx += 2
+            continue
+        items.append(_tok_to_ast(tok))
+        idx += 1
+
+    return normalize_equation_ast({"kind": "seq", "items": items})
+
+
+def parse_omml_to_equation_ast(omml_el: ET.Element) -> dict:
+    def _local_tag(el: ET.Element) -> str:
+        return el.tag.split("}")[-1] if "}" in el.tag else el.tag
+
+    def _parse_children(container: ET.Element) -> dict:
+        child_items: List[dict] = []
+        for ch in container:
+            child_items.append(_parse_el(ch))
+        return normalize_equation_ast({"kind": "seq", "items": child_items})
+
+    def _parse_el(el: ET.Element) -> dict:
+        lt = _local_tag(el)
+        if lt in ("oMathPara", "oMath", "e", "num", "den", "sub", "sup"):
+            return _parse_children(el)
+        if lt == "r":
+            txt = "".join(t.text or "" for t in el.iter() if _local_tag(t) == "t")
+            return parse_latex_to_equation_ast(txt) if len(txt) > 1 and not txt.isalnum() else {"kind": "sym", "val": txt}
+        if lt == "f":
+            num_el = next((c for c in el if _local_tag(c) == "num"), None)
+            den_el = next((c for c in el if _local_tag(c) == "den"), None)
+            return normalize_equation_ast({
+                "kind": "frac",
+                "num": _parse_el(num_el) if num_el is not None else {"kind": "sym", "val": "1"},
+                "den": _parse_el(den_el) if den_el is not None else {"kind": "sym", "val": "1"},
+            })
+        if lt == "rad":
+            e_el = next((c for c in el if _local_tag(c) == "e"), None)
+            return normalize_equation_ast({
+                "kind": "sqrt",
+                "body": _parse_el(e_el) if e_el is not None else {"kind": "sym", "val": "x"},
+            })
+        if lt == "sSup":
+            e_el = next((c for c in el if _local_tag(c) == "e"), None)
+            sup_el = next((c for c in el if _local_tag(c) == "sup"), None)
+            return normalize_equation_ast({
+                "kind": "sup",
+                "base": _parse_el(e_el) if e_el is not None else {"kind": "sym", "val": "x"},
+                "exp": _parse_el(sup_el) if sup_el is not None else {"kind": "sym", "val": "2"},
+            })
+        if lt == "sSub":
+            e_el = next((c for c in el if _local_tag(c) == "e"), None)
+            sub_el = next((c for c in el if _local_tag(c) == "sub"), None)
+            return normalize_equation_ast({
+                "kind": "sub",
+                "base": _parse_el(e_el) if e_el is not None else {"kind": "sym", "val": "x"},
+                "sub": _parse_el(sub_el) if sub_el is not None else {"kind": "sym", "val": "i"},
+            })
+        if lt == "sSubSup":
+            e_el = next((c for c in el if _local_tag(c) == "e"), None)
+            sub_el = next((c for c in el if _local_tag(c) == "sub"), None)
+            sup_el = next((c for c in el if _local_tag(c) == "sup"), None)
+            return normalize_equation_ast({
+                "kind": "subsup",
+                "base": _parse_el(e_el) if e_el is not None else {"kind": "sym", "val": "x"},
+                "sub": _parse_el(sub_el) if sub_el is not None else {"kind": "sym", "val": "i"},
+                "exp": _parse_el(sup_el) if sup_el is not None else {"kind": "sym", "val": "2"},
+            })
+        return _parse_children(el)
+
+    return _parse_el(omml_el)
+
+
+def compile_equation_ast_to_latex(ast_node: dict) -> str:
+    node = normalize_equation_ast(ast_node)
+    kind = node.get("kind", "sym")
+    if kind == "sym":
+        val = str(node.get("val", ""))
+        return _UNICODE_TO_LATEX_SYM.get(val, val)
+    if kind == "seq":
+        return " ".join(compile_equation_ast_to_latex(it) for it in node.get("items", []))
+    if kind == "frac":
+        return f"\\frac{{{compile_equation_ast_to_latex(node['num'])}}}{{{compile_equation_ast_to_latex(node['den'])}}}"
+    if kind == "sqrt":
+        return f"\\sqrt{{{compile_equation_ast_to_latex(node['body'])}}}"
+    if kind == "sup":
+        return f"{{{compile_equation_ast_to_latex(node['base'])}}}^{{{compile_equation_ast_to_latex(node['exp'])}}}"
+    if kind == "sub":
+        return f"{{{compile_equation_ast_to_latex(node['base'])}}}_{{{compile_equation_ast_to_latex(node['sub'])}}}"
+    if kind == "subsup":
+        return (
+            f"{{{compile_equation_ast_to_latex(node['base'])}}}"
+            f"_{{{compile_equation_ast_to_latex(node['sub'])}}}"
+            f"^{{{compile_equation_ast_to_latex(node['exp'])}}}"
+        )
+    return str(node.get("val", ""))
+
+
+def compile_equation_ast_to_hwpeqn(ast_node: dict) -> str:
+    node = normalize_equation_ast(ast_node)
+    kind = node.get("kind", "sym")
+    if kind == "sym":
+        val = str(node.get("val", ""))
+        return _UNICODE_TO_HWPEQN_SYM.get(val, val)
+    if kind == "seq":
+        return " ".join(compile_equation_ast_to_hwpeqn(it) for it in node.get("items", []))
+    if kind == "frac":
+        return f"{{{compile_equation_ast_to_hwpeqn(node['num'])}}} over {{{compile_equation_ast_to_hwpeqn(node['den'])}}}"
+    if kind == "sqrt":
+        return f"sqrt {{{compile_equation_ast_to_hwpeqn(node['body'])}}}"
+    if kind == "sup":
+        return f"{{{compile_equation_ast_to_hwpeqn(node['base'])}}} ^ {{{compile_equation_ast_to_hwpeqn(node['exp'])}}}"
+    if kind == "sub":
+        return f"{{{compile_equation_ast_to_hwpeqn(node['base'])}}} _ {{{compile_equation_ast_to_hwpeqn(node['sub'])}}}"
+    if kind == "subsup":
+        return (
+            f"{{{compile_equation_ast_to_hwpeqn(node['base'])}}} "
+            f"_ {{{compile_equation_ast_to_hwpeqn(node['sub'])}}} "
+            f"^ {{{compile_equation_ast_to_hwpeqn(node['exp'])}}}"
+        )
+    return str(node.get("val", ""))
+
+
+def compile_equation_ast_to_omml_element(ast_node: dict) -> ET.Element:
+    def _m(tag: str) -> str:
+        return f"{{{NS_OMML}}}{tag}"
+
+    def _emit_into(parent: ET.Element, n: dict) -> None:
+        node = normalize_equation_ast(n)
+        kind = node.get("kind", "sym")
+        if kind == "sym":
+            val = strip_illegal_xml_control_chars(str(node.get("val", "")))
+            if val:
+                r_el = ET.SubElement(parent, _m("r"))
+                t_el = ET.SubElement(r_el, _m("t"))
+                t_el.text = val
+            return
+        if kind == "seq":
+            for it in node.get("items", []):
+                _emit_into(parent, it)
+            return
+        if kind == "frac":
+            f_el = ET.SubElement(parent, _m("f"))
+            num_el = ET.SubElement(f_el, _m("num"))
+            _emit_into(num_el, node["num"])
+            den_el = ET.SubElement(f_el, _m("den"))
+            _emit_into(den_el, node["den"])
+            return
+        if kind == "sqrt":
+            rad_el = ET.SubElement(parent, _m("rad"))
+            rad_pr = ET.SubElement(rad_el, _m("radPr"))
+            ET.SubElement(rad_pr, _m("degHide"), {_m("val"): "1"})
+            ET.SubElement(rad_el, _m("deg"))
+            e_el = ET.SubElement(rad_el, _m("e"))
+            _emit_into(e_el, node["body"])
+            return
+        if kind == "sup":
+            ssup_el = ET.SubElement(parent, _m("sSup"))
+            e_el = ET.SubElement(ssup_el, _m("e"))
+            _emit_into(e_el, node["base"])
+            sup_el = ET.SubElement(ssup_el, _m("sup"))
+            _emit_into(sup_el, node["exp"])
+            return
+        if kind == "sub":
+            ssub_el = ET.SubElement(parent, _m("sSub"))
+            e_el = ET.SubElement(ssub_el, _m("e"))
+            _emit_into(e_el, node["base"])
+            sub_el = ET.SubElement(ssub_el, _m("sub"))
+            _emit_into(sub_el, node["sub"])
+            return
+        if kind == "subsup":
+            ssubsup_el = ET.SubElement(parent, _m("sSubSup"))
+            e_el = ET.SubElement(ssubsup_el, _m("e"))
+            _emit_into(e_el, node["base"])
+            sub_el = ET.SubElement(ssubsup_el, _m("sub"))
+            _emit_into(sub_el, node["sub"])
+            sup_el = ET.SubElement(ssubsup_el, _m("sup"))
+            _emit_into(sup_el, node["exp"])
+            return
+
+    omath_el = ET.Element(_m("oMath"))
+    _emit_into(omath_el, ast_node)
+    return omath_el
+
+
+def compile_equation_ast_to_linear_text(ast_node: dict) -> str:
+    omml_el = compile_equation_ast_to_omml_element(ast_node)
+    return "".join(omml_el.itertext())
+

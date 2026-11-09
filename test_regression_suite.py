@@ -1,8 +1,12 @@
 """
-T-DIR v3.2.0-beta 8-Cohort Parametric Regression Experiment Suite (EXP-01 ~ EXP-08).
+T-DIR v4.0.0 13-Cohort Parametric Regression Experiment Suite (EXP-01 ~ EXP-13).
 Validates universal document intermediate representation, unsupervised heading spectrum detection,
 generalized template slot & 2RxC media grid scanning, numerical page-budget allocation,
-and 6-stage MinimumInvasionElasticSolver across diverse document topologies and metric spaces.
+6-stage MinimumInvasionElasticSolver, standalone OWPML (.hwpx) synthesis & lifting,
+3-Way Isomorphic Equation AST compilation (OMML <-> HWP EQN <-> LaTeX),
+bidirectional OpenXML Spreadsheet (.xlsx) & Semantic HTML5 DOM (.html) codecs,
+deterministic pure-Python PDF 1.4 projection & 3-tier verification,
+and full security/side-effect hardening ([SEC-01] ~ [SEC-06]).
 """
 
 import os
@@ -21,14 +25,29 @@ from tdir_mcp_beta.ir_schema import (
     detect_image_format,
     compute_heading_slot_similarity,
     extract_ordinal_index,
+    strip_illegal_xml_control_chars,
+    validate_safe_filesystem_path,
+    validate_safe_zip_archive,
+    safe_parse_xml_bytes,
+    sanitize_spreadsheet_cell_formula,
+    parse_latex_to_equation_ast,
+    parse_hwpeqn_to_equation_ast,
+    parse_omml_to_equation_ast,
+    compile_equation_ast_to_latex,
+    compile_equation_ast_to_hwpeqn,
+    compile_equation_ast_to_omml_element,
+    compile_equation_ast_to_linear_text,
 )
 from tdir_mcp_beta.cfb_ole2 import CFBArchive, write_cfb_file
 from tdir_mcp_beta.codec_hwp_v5 import (
+    HWPTAG_EQEDIT,
     extract_hwp_para_text,
     parse_hwp_records,
     pack_hwp_record,
     scan_hwp_template_slots,
+    parse_hwp_eqedit_payload,
 )
+from tdir_mcp_beta.codec_tabular_markup import inspect_pdf_file
 
 TEMPLATE_HWP_PATH = r"C:\Users\stella\Downloads\모창 사업계획서 템플릿 test.hwp"
 SOURCE_DOCX_PATH = r"C:\Users\stella\Downloads\모창 2차 사업계획서 — 한컴독스_완벽호환본.docx"
@@ -607,14 +626,328 @@ def run_exp08_multisource_and_agent_loop_cohort(srv: TdirBetaMcpServer) -> dict:
     }
 
 
+def run_exp09_standalone_hwpx_synthesis_and_lifting_cohort(srv: TdirBetaMcpServer, real_job_id: str) -> dict:
+    """
+    EXP-09 ([P2-01]): Validates standalone OWPML (.hwpx) package synthesis without any reference
+    base_hwpx_path (base_hwpx_path=None), binary image injection (<hp:pic> + Contents/BinData/),
+    and bidirectional .hwpx source lifting -> .docx/.hwp round-trip.
+    """
+    out_standalone = os.path.join(REGRESSION_OUT_DIR, "exp09_standalone_hwpx")
+    exec_res = srv.tdir_execute_conversion(
+        job_id=real_job_id,
+        output_prefix=out_standalone,
+        output_formats=["hwpx"],
+        base_hwpx_path=None,
+        user_spec_overrides={
+            "exclude_sections": ["SEC_03", "SEC_04"],
+            "total_page_limit": 8,
+            "preserve_outer_tables": True,
+            "route_media_to_attachment_slots": True,
+            "max_attachment_images": 2,
+        },
+    )
+    hwpx_meta = exec_res["generated_files"]["hwpx"]
+    hwpx_path = hwpx_meta["out_hwpx_path"]
+    assert hwpx_meta["standalone_synthesized"] is True
+    assert hwpx_meta["embedded_images_count"] == 2
+
+    ver_standalone = srv.tdir_verify_fidelity_and_layout(real_job_id, export_pdf=False)
+    assert ver_standalone["fidelity_results"]["hwpx"]["all_sections_verified"] is True
+
+    with zipfile.ZipFile(hwpx_path, "r") as zf:
+        namelist = zf.namelist()
+        assert namelist[0] == "mimetype"
+        assert "Contents/header.xml" in namelist
+        assert "Contents/section0.xml" in namelist
+        assert "Contents/content.hpf" in namelist
+        bin_entries = [n for n in namelist if n.startswith("Contents/BinData/")]
+        assert len(bin_entries) == 2
+
+    # Bidirectional .hwpx source lifting -> .docx / .hwp round-trip
+    probe_hwpx = srv.tdir_probe_files([hwpx_path], TEMPLATE_HWP_PATH)
+    hwpx_job_id = probe_hwpx["job_id"]
+    lifted_secs = probe_hwpx["sources"][0]["sections_discovered"]
+    assert len(lifted_secs) >= 2
+    assert sum(s["media_count"] for s in lifted_secs) == 2
+
+    rt_hwpx_out = os.path.join(REGRESSION_OUT_DIR, "exp09_lifted_from_hwpx")
+    srv.tdir_execute_conversion(
+        job_id=hwpx_job_id,
+        output_prefix=rt_hwpx_out,
+        output_formats=["hwp", "docx"],
+    )
+    ver_lifted = srv.tdir_verify_fidelity_and_layout(hwpx_job_id, export_pdf=False)
+    assert ver_lifted["fidelity_results"]["hwp"]["all_sections_verified"] is True
+    assert ver_lifted["fidelity_results"]["docx"]["all_sections_verified"] is True
+
+    return {
+        "standalone_synthesized": hwpx_meta["standalone_synthesized"],
+        "embedded_images_count": hwpx_meta["embedded_images_count"],
+        "standalone_hwpx_verified": ver_standalone["fidelity_results"]["hwpx"]["all_sections_verified"],
+        "lifted_hwpx_sections": len(lifted_secs),
+        "lifted_hwpx_media_count": sum(s["media_count"] for s in lifted_secs),
+        "roundtrip_to_hwp_docx_verified": (
+            ver_lifted["fidelity_results"]["hwp"]["all_sections_verified"]
+            and ver_lifted["fidelity_results"]["docx"]["all_sections_verified"]
+        ),
+    }
+
+
+def run_exp10_three_way_equation_ast_cohort(srv: TdirBetaMcpServer) -> dict:
+    """
+    EXP-10 ([P2-02]): Validates 3-Way Isomorphic Equation AST compilation across
+    Word OMML (<m:oMath>) <-> Hancom Equation Script (HWPTAG_EQEDIT / <hp:equation>) <-> LaTeX ($...$).
+    """
+    latex_expr = r"\frac{\alpha_{1} + \beta^{2}}{\sqrt{x_{0} + 1}} = \sum_{i=1}^{N} x_{i}"
+    ast_from_latex = parse_latex_to_equation_ast(latex_expr)
+    hwpeqn_str = compile_equation_ast_to_hwpeqn(ast_from_latex)
+    omml_el = compile_equation_ast_to_omml_element(ast_from_latex)
+    ast_from_hwpeqn = parse_hwpeqn_to_equation_ast(hwpeqn_str)
+    ast_from_omml = parse_omml_to_equation_ast(omml_el)
+
+    lin_latex = compile_equation_ast_to_linear_text(ast_from_latex)
+    lin_hwpeqn = compile_equation_ast_to_linear_text(ast_from_hwpeqn)
+    lin_omml = compile_equation_ast_to_linear_text(ast_from_omml)
+    assert lin_latex == lin_hwpeqn == lin_omml, f"Linear text mismatch: {lin_latex} vs {lin_hwpeqn} vs {lin_omml}"
+    assert compile_equation_ast_to_latex(ast_from_hwpeqn) == compile_equation_ast_to_latex(ast_from_omml)
+
+    eq_md_path = os.path.join(REGRESSION_OUT_DIR, "exp10_equations.md")
+    with open(eq_md_path, "w", encoding="utf-8") as f_eq:
+        f_eq.write(
+            "# 제1장 3원 동형 수식 AST 검증\n\n"
+            "인라인 에너지 등가 수식 $E = m c^{2}$ 및 분수 루트 수식을 검증합니다.\n\n"
+            "$$\\frac{a + b}{\\sqrt{x_{1} + y^{2}}}$$\n"
+        )
+
+    probe_eq = srv.tdir_probe_files([eq_md_path], TEMPLATE_HWP_PATH)
+    eq_job_id = probe_eq["job_id"]
+    out_eq_prefix = os.path.join(REGRESSION_OUT_DIR, "exp10_equations_out")
+    exec_eq = srv.tdir_execute_conversion(
+        job_id=eq_job_id,
+        output_prefix=out_eq_prefix,
+        output_formats=["hwp", "hwpx", "docx", "html", "md"],
+        base_hwpx_path=None,
+    )
+    ver_eq = srv.tdir_verify_fidelity_and_layout(eq_job_id, export_pdf=False)
+    for fmt_k in ("hwp", "hwpx", "docx", "html"):
+        assert ver_eq["fidelity_results"][fmt_k]["all_sections_verified"] is True
+
+    # Verify HWPTAG_EQEDIT (Tag 105) binary records in .hwp
+    cfb_eq = CFBArchive(exec_eq["generated_files"]["hwp"]["out_hwp_path"])
+    sec0_eq = parse_hwp_records(zlib.decompress(cfb_eq.get_stream("Section0"), -15))
+    eqedit_scripts = [parse_hwp_eqedit_payload(pay) for t_id, _, pay in sec0_eq if t_id == HWPTAG_EQEDIT]
+    assert len(eqedit_scripts) == 2, f"Expected 2 HWPTAG_EQEDIT records, got {len(eqedit_scripts)}"
+    assert any("over" in s and "sqrt" in s for s in eqedit_scripts)
+
+    return {
+        "linear_text_isomorphism": lin_latex,
+        "hwpeqn_compiled": hwpeqn_str,
+        "hwp_eqedit_records_count": len(eqedit_scripts),
+        "all_equation_formats_verified": True,
+    }
+
+
+def run_exp11_xlsx_and_html_bidirectional_cohort(srv: TdirBetaMcpServer, real_job_id: str) -> dict:
+    """
+    EXP-11 ([P3-01]): Validates bidirectional OpenXML Spreadsheet (.xlsx) and Semantic HTML5 DOM (.html)
+    projection and lifting with merged cells (<mergeCells> / rowspan/colspan) and 100.00% SHA-256 fidelity.
+    """
+    out_xh_prefix = os.path.join(REGRESSION_OUT_DIR, "exp11_xlsx_html")
+    exec_xh = srv.tdir_execute_conversion(
+        job_id=real_job_id,
+        output_prefix=out_xh_prefix,
+        output_formats=["xlsx", "html"],
+        user_spec_overrides={
+            "exclude_sections": ["SEC_03", "SEC_04"],
+            "total_page_limit": 8,
+            "route_media_to_attachment_slots": True,
+            "max_attachment_images": 2,
+        },
+    )
+    ver_xh = srv.tdir_verify_fidelity_and_layout(real_job_id, export_pdf=False)
+    assert ver_xh["fidelity_results"]["xlsx"]["all_sections_verified"] is True
+    assert ver_xh["fidelity_results"]["html"]["all_sections_verified"] is True
+
+    xlsx_path = exec_xh["generated_files"]["xlsx"]["out_xlsx_path"]
+    html_path = exec_xh["generated_files"]["html"]["out_html_path"]
+
+    probe_xlsx = srv.tdir_probe_files([xlsx_path], TEMPLATE_HWP_PATH)
+    probe_html = srv.tdir_probe_files([html_path], TEMPLATE_HWP_PATH)
+    xlsx_secs = probe_xlsx["sources"][0]["sections_discovered"]
+    html_secs = probe_html["sources"][0]["sections_discovered"]
+    assert len(xlsx_secs) == 2
+    assert len(html_secs) == 2
+
+    out_from_html = os.path.join(REGRESSION_OUT_DIR, "exp11_from_html")
+    srv.tdir_execute_conversion(
+        job_id=probe_html["job_id"],
+        output_prefix=out_from_html,
+        output_formats=["hwp", "docx"],
+    )
+    ver_from_html = srv.tdir_verify_fidelity_and_layout(probe_html["job_id"], export_pdf=False)
+    assert ver_from_html["fidelity_results"]["hwp"]["all_sections_verified"] is True
+    assert ver_from_html["fidelity_results"]["docx"]["all_sections_verified"] is True
+
+    return {
+        "xlsx_rows_emitted": exec_xh["generated_files"]["xlsx"]["rows_emitted"],
+        "xlsx_merged_ranges_count": exec_xh["generated_files"]["xlsx"]["merged_ranges_count"],
+        "xlsx_shared_strings_count": exec_xh["generated_files"]["xlsx"]["shared_strings_count"],
+        "xlsx_fidelity_verified": ver_xh["fidelity_results"]["xlsx"]["all_sections_verified"],
+        "html_fidelity_verified": ver_xh["fidelity_results"]["html"]["all_sections_verified"],
+        "roundtrip_from_html_verified": ver_from_html["fidelity_results"]["hwp"]["all_sections_verified"],
+    }
+
+
+def run_exp12_deterministic_pdf_and_3tier_verifier_cohort(srv: TdirBetaMcpServer, real_job_id: str) -> dict:
+    """
+    EXP-12 ([P3-02]): Validates deterministic pure-Python multi-page PDF 1.4 projection (project_ir_to_pdf)
+    with Type0/CIDFontType2 UTF-16BE CJK strings and 3-tier layout/text verification.
+    """
+    out_pdf_prefix = os.path.join(REGRESSION_OUT_DIR, "exp12_native_pdf")
+    exec_pdf = srv.tdir_execute_conversion(
+        job_id=real_job_id,
+        output_prefix=out_pdf_prefix,
+        output_formats=["pdf"],
+        user_spec_overrides={
+            "exclude_sections": ["SEC_03", "SEC_04"],
+            "total_page_limit": 8,
+            "preserve_outer_tables": True,
+            "route_media_to_attachment_slots": True,
+            "max_attachment_images": 2,
+        },
+    )
+    ver_pdf = srv.tdir_verify_fidelity_and_layout(real_job_id, export_pdf=True)
+    pdf_f = ver_pdf["fidelity_results"]["pdf"]
+    assert pdf_f["tier_used"] == "BUILTIN_DETERMINISTIC_PDF14"
+    assert pdf_f["actual_pdf_pages"] == 8
+    assert pdf_f["page_budget_matched"] is True
+    assert pdf_f["all_sections_verified"] is True
+
+    inspected = inspect_pdf_file(exec_pdf["generated_files"]["pdf"]["out_pdf_path"])
+    assert inspected["actual_pdf_pages"] == 8
+    assert inspected["non_ws_chars"] > 5000
+
+    return {
+        "tier_used": pdf_f["tier_used"],
+        "actual_pdf_pages": pdf_f["actual_pdf_pages"],
+        "page_budget_matched": pdf_f["page_budget_matched"],
+        "utf16be_text_verified": pdf_f["all_sections_verified"],
+        "extracted_non_ws_chars": inspected["non_ws_chars"],
+    }
+
+
+def run_exp13_security_and_idempotence_cohort(srv: TdirBetaMcpServer, real_job_id: str) -> dict:
+    """
+    EXP-13 ([SEC-01] ~ [SEC-06]): Validates security hardening and multi-run job state idempotence:
+      - [SEC-01] XML XXE / DOCTYPE Entity Expansion rejection
+      - [SEC-02] ZIP Path Traversal (Zip-Slip) rejection
+      - [SEC-03] MS-CFB MiniFAT cycle resilience
+      - [SEC-04] Null-byte filesystem path traversal guard
+      - [SEC-05] Illegal XML control-char stripping & DDE formula injection neutralization
+      - [SEC-06] Multi-run job idempotence (copy.deepcopy block isolation) & LRU job cache ceiling
+    """
+    # [SEC-01] XML XXE / Entity Expansion rejection
+    xxe_blocked = False
+    try:
+        safe_parse_xml_bytes(b'<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe "secret">]><root>&xxe;</root>')
+    except ValueError:
+        xxe_blocked = True
+    assert xxe_blocked is True
+
+    # [SEC-02] Zip-Slip traversal rejection
+    zipslip_path = os.path.join(REGRESSION_OUT_DIR, "exp13_zipslip.zip")
+    with zipfile.ZipFile(zipslip_path, "w") as zf_evil:
+        zf_evil.writestr("../../evil_escape.txt", b"malicious")
+    zipslip_blocked = False
+    try:
+        validate_safe_zip_archive(zipslip_path)
+    except ValueError:
+        zipslip_blocked = True
+    os.remove(zipslip_path)
+    assert zipslip_blocked is True
+
+    # [SEC-03] CFB MiniFAT self-loop cycle guard on real binary CFB bytes
+    with open(TEMPLATE_HWP_PATH, "rb") as f_cfb_orig:
+        mut_cfb_bytes = bytearray(f_cfb_orig.read())
+    first_mf_sec = struct.unpack_from("<I", mut_cfb_bytes, 60)[0]
+    if first_mf_sec < 0xFFFFFFFE:
+        mf_off = (first_mf_sec + 1) * 512
+        # Inject self-loop cycle minifat[0] = 0, minifat[1] = 1
+        struct.pack_into("<II", mut_cfb_bytes, mf_off, 0, 1)
+    loop_cfb_path = os.path.join(REGRESSION_OUT_DIR, "exp13_minifat_loop.cfb")
+    with open(loop_cfb_path, "wb") as f_cfb_mut:
+        f_cfb_mut.write(mut_cfb_bytes)
+    cfb_loop = CFBArchive(loop_cfb_path)
+    fh_stream = cfb_loop.get_stream("FileHeader")
+    assert len(fh_stream) == 256
+    os.remove(loop_cfb_path)
+
+    # [SEC-04] Null-byte path guard
+    null_path_blocked = False
+    try:
+        validate_safe_filesystem_path("malicious\x00file.docx")
+    except ValueError:
+        null_path_blocked = True
+    assert null_path_blocked is True
+
+    # [SEC-05] Control-char stripping & DDE formula neutralization
+    assert strip_illegal_xml_control_chars("A\x00\x07B\x0b\x1fC\n\t") == "ABC\n\t"
+    assert sanitize_spreadsheet_cell_formula("=CMD|' /C calc'!A0") == "'=CMD|' /C calc'!A0"
+
+    # [SEC-06] Multi-run job idempotence (tight 1.0p run followed by loose 3.0p run on the same job_id)
+    out_idemp_tight = os.path.join(REGRESSION_OUT_DIR, "exp13_idemp_tight")
+    exec_tight = srv.tdir_execute_conversion(
+        job_id=real_job_id,
+        output_prefix=out_idemp_tight,
+        output_formats=["md"],
+        user_spec_overrides={
+            "exclude_sections": ["SEC_03", "SEC_04"],
+            "section_page_budgets": {"SEC_01": 1.0, "SEC_02": 1.0},
+            "allow_font_size_elastic_scaling": True,
+        },
+    )
+    merges_run1_tight = sum(
+        t["merged_subheadings_count"] + t["merged_cell_pairs_count"] + t["merged_body_pairs_count"]
+        for t in exec_tight["solver_telemetry"].values()
+    )
+    assert merges_run1_tight > 0
+
+    out_idemp_loose = os.path.join(REGRESSION_OUT_DIR, "exp13_idemp_loose")
+    exec_loose = srv.tdir_execute_conversion(
+        job_id=real_job_id,
+        output_prefix=out_idemp_loose,
+        output_formats=["md"],
+        user_spec_overrides={
+            "exclude_sections": ["SEC_03", "SEC_04"],
+            "section_page_budgets": {"SEC_01": 3.0, "SEC_02": 3.0},
+        },
+    )
+    merges_run2_loose = sum(
+        t["merged_subheadings_count"] + t["merged_cell_pairs_count"] + t["merged_body_pairs_count"]
+        for t in exec_loose["solver_telemetry"].values()
+    )
+    assert merges_run2_loose == 0, f"Expected 0 merges on subsequent loose run, got {merges_run2_loose}"
+    assert srv.max_jobs == 64
+
+    return {
+        "xxe_entity_blocked": xxe_blocked,
+        "zip_slip_blocked": zipslip_blocked,
+        "cfb_minifat_cycle_terminated": True,
+        "null_byte_path_blocked": null_path_blocked,
+        "dde_formula_neutralized": True,
+        "idempotent_merges_tight_then_loose": (merges_run1_tight, merges_run2_loose),
+        "max_jobs_lru_cap": srv.max_jobs,
+    }
+
+
 def main() -> None:
     os.makedirs(REGRESSION_OUT_DIR, exist_ok=True)
     srv = TdirBetaMcpServer()
 
     init_resp = handle_jsonrpc_request(srv, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
-    assert init_resp["result"]["serverInfo"]["version"] == "3.2.0-beta"
+    assert init_resp["result"]["serverInfo"]["version"] == "4.0.0"
 
-    print("=== RUNNING T-DIR v3.2.0-BETA 8-COHORT PARAMETRIC REGRESSION MATRIX (EXP-01 ~ EXP-08) ===")
+    print("=== RUNNING T-DIR v4.0.0 13-COHORT PARAMETRIC REGRESSION MATRIX (EXP-01 ~ EXP-13) ===")
     res_01 = run_exp01_hierarchy_and_heading_spectrum_cohort(srv)
     print(f"[EXP-01 PASS] Hierarchy & Heading Spectrum: {json.dumps(res_01, ensure_ascii=False)}")
 
@@ -643,7 +976,22 @@ def main() -> None:
     res_08 = run_exp08_multisource_and_agent_loop_cohort(srv)
     print(f"[EXP-08 PASS] Multi-Source Heterogeneous Merge & Agent Loop: {json.dumps(res_08, ensure_ascii=False)}")
 
-    print("\n=== ALL 8 PARAMETRIC REGRESSION COHORTS (EXP-01 ~ EXP-08) PASSED (100.00% FIDELITY) ===")
+    res_09 = run_exp09_standalone_hwpx_synthesis_and_lifting_cohort(srv, res_01["real_job_id"])
+    print(f"[EXP-09 PASS] Standalone OWPML (.hwpx) Synthesis & Lifting: {json.dumps(res_09, ensure_ascii=False)}")
+
+    res_10 = run_exp10_three_way_equation_ast_cohort(srv)
+    print(f"[EXP-10 PASS] 3-Way Isomorphic Equation AST (OMML/HWP/LaTeX): {json.dumps(res_10, ensure_ascii=False)}")
+
+    res_11 = run_exp11_xlsx_and_html_bidirectional_cohort(srv, res_01["real_job_id"])
+    print(f"[EXP-11 PASS] Bidirectional OpenXML (.xlsx) & HTML5 DOM (.html): {json.dumps(res_11, ensure_ascii=False)}")
+
+    res_12 = run_exp12_deterministic_pdf_and_3tier_verifier_cohort(srv, res_01["real_job_id"])
+    print(f"[EXP-12 PASS] Deterministic Pure-Python PDF 1.4 & 3-Tier Verifier: {json.dumps(res_12, ensure_ascii=False)}")
+
+    res_13 = run_exp13_security_and_idempotence_cohort(srv, res_01["real_job_id"])
+    print(f"[EXP-13 PASS] Security Hardening ([SEC-01]~[SEC-06]) & Idempotence: {json.dumps(res_13, ensure_ascii=False)}")
+
+    print("\n=== ALL 13 PARAMETRIC REGRESSION COHORTS (EXP-01 ~ EXP-13) PASSED (100.00% FIDELITY & ZERO OPEN ITEMS) ===")
 
 
 if __name__ == "__main__":
