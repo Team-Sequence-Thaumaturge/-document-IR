@@ -30,16 +30,19 @@
 
 ---
 
-## 2. 빠른 시작 (클론 없는 `uvx` / `pip` 원라인 실행 또는 로컬 실행)
+## 2. 빠른 시작 (클론 없는 `npx` / `uvx` 원라인 실행 또는 로컬 실행)
 
-### 방법 A — 클론 없이 `uvx` 또는 `pip` 원라인 실행 (권장)
-외부 패키지 설치 없이 GitHub에서 즉시 `sadt-mcp`를 실행할 수 있습니다.
+### 방법 A — 클론 없이 `npx` 또는 `uvx` 원라인 실행 (권장)
+외부 패키지 설치 없이 npm(`@quanxs/sadt-mcp`) 또는 GitHub `uvx`로 즉시 `sadt-mcp`를 실행할 수 있습니다.
 
 ```bash
-# 1. 클론 없이 uvx로 MCP stdio 서버 즉시 실행
+# 1. npm / npx로 클론 없이 MCP stdio 서버 즉시 실행
+npx -y @quanxs/sadt-mcp
+
+# 2. 또는 클론 없이 uvx로 GitHub 저장소에서 바로 실행
 uvx --from git+https://github.com/Team-Sequence-Thaumaturge/-document-IR sadt-mcp
 
-# 2. 또는 pip로 GitHub 저장소 직접 설치 후 실행
+# 3. 또는 pip로 GitHub 저장소 직접 설치 후 실행
 pip install git+https://github.com/Team-Sequence-Thaumaturge/-document-IR.git
 sadt-mcp
 ```
@@ -50,12 +53,8 @@ Claude Desktop, Cursor, Windsurf, Antigravity 등의 MCP 설정에 아래 JSON�
 {
   "mcpServers": {
     "sadt-mcp": {
-      "command": "uvx",
-      "args": [
-        "--from",
-        "git+https://github.com/Team-Sequence-Thaumaturge/-document-IR",
-        "sadt-mcp"
-      ]
+      "command": "npx",
+      "args": ["-y", "@quanxs/sadt-mcp"]
     }
   }
 }

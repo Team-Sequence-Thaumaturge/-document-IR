@@ -30,32 +30,31 @@
 
 ---
 
-## 2. Quickstart (Zero-Clone One-Line `uvx` / `pip` or Local Run)
+## 2. Quickstart (Zero-Clone One-Line `npx` / `uvx` or Local Run)
 
-### Option A — Zero-Clone One-Line Run via `uvx` or `pip` (Recommended)
-Run `sadt-mcp` directly from GitHub with zero external pip dependencies:
+### Option A — Zero-Clone One-Line Run via `npx` or `uvx` (Recommended)
+Run `sadt-mcp` directly via npm (`@quanxs/sadt-mcp`) or GitHub `uvx` with zero external pip dependencies:
 
 ```bash
-# 1. Run MCP stdio server immediately without cloning (uvx)
+# 1. Run MCP stdio server immediately via npm / npx
+npx -y @quanxs/sadt-mcp
+
+# 2. Or run directly from GitHub without cloning (uvx)
 uvx --from git+https://github.com/Team-Sequence-Thaumaturge/-document-IR sadt-mcp
 
-# 2. Or install via pip directly from GitHub
+# 3. Or install via pip directly from GitHub
 pip install git+https://github.com/Team-Sequence-Thaumaturge/-document-IR.git
 sadt-mcp
 ```
 
-Add `sadt-mcp` directly to Claude Desktop, Cursor, Windsurf, or Antigravity MCP settings (no local clone needed):
+Add `@quanxs/sadt-mcp` directly to Claude Desktop, Cursor, Windsurf, or Antigravity MCP settings (no local clone needed):
 
 ```json
 {
   "mcpServers": {
     "sadt-mcp": {
-      "command": "uvx",
-      "args": [
-        "--from",
-        "git+https://github.com/Team-Sequence-Thaumaturge/-document-IR",
-        "sadt-mcp"
-      ]
+      "command": "npx",
+      "args": ["-y", "@quanxs/sadt-mcp"]
     }
   }
 }

@@ -10,6 +10,19 @@
   },
   "packages": [
     {
+      "registryType": "npm",
+      "identifier": "@quanxs/sadt-mcp",
+      "version": "4.1.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "runtimeHint": "npx",
+      "runtimeArguments": [
+        "-y",
+        "@quanxs/sadt-mcp"
+      ]
+    },
+    {
       "registryType": "pypi",
       "identifier": "sadt-mcp",
       "version": "4.1.0",

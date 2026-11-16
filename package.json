@@ -1,0 +1,61 @@
+{
+  "name": "@quanxs/sadt-mcp",
+  "version": "4.1.0",
+  "publishConfig": {
+    "access": "public"
+  },
+  "description": "SADT (Stella Actuation Document Transfer): Zero-dependency Python MCP server and converter for Korean HWP v5.0, HWPX (OWPML), DOCX, XLSX, PDF, HTML, Markdown, and CSV with 3-way Equation AST.",
+  "main": "bin/sadt-mcp.js",
+  "bin": {
+    "sadt-mcp": "bin/sadt-mcp.js",
+    "sadt": "bin/sadt-mcp.js",
+    "tdir-mcp": "bin/sadt-mcp.js"
+  },
+  "files": [
+    "bin/sadt-mcp.js",
+    "__init__.py",
+    "cfb_ole2.py",
+    "codec_hwp_v5.py",
+    "codec_ooxml_owpml.py",
+    "codec_tabular_markup.py",
+    "elastic_solver.py",
+    "ir_schema.py",
+    "mcp_server.py",
+    "pyproject.toml",
+    "server.json",
+    "glama.json",
+    "llms.txt",
+    "LICENSE",
+    "README.md",
+    "README_KO.md"
+  ],
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "hwp",
+    "hwpx",
+    "docx",
+    "xlsx",
+    "pdf",
+    "document-converter",
+    "korean",
+    "hangul",
+    "owpml",
+    "ooxml",
+    "sadt"
+  ],
+  "author": "김치성 (Quanxs / Team Sequence) <chi@quanxs.com>",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Team-Sequence-Thaumaturge/-document-IR.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Team-Sequence-Thaumaturge/-document-IR/issues"
+  },
+  "homepage": "https://salabs.quanxs.com/tools/sadt-hwp-hwpx-document-mcp-hub.html",
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}

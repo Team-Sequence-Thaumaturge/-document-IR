@@ -1,4 +1,8 @@
 # Smithery MCP Server Configuration
+name: "@quanxs/sadt-mcp"
+version: "4.1.0"
+repository: "https://github.com/Team-Sequence-Thaumaturge/-document-IR"
+homepage: "https://salabs.quanxs.com/tools/sadt-hwp-hwpx-document-mcp-hub.html"
 startCommand:
   type: stdio
   configSchema:
