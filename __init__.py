@@ -1,10 +1,11 @@
 """
-T-DIR v4.0.0 Isolated MCP Server Package.
-Topological Document Intermediate Representation with 100.00% Text Immutability,
-Dynamic File/Template Spec Extraction, User Spec Override Priority, 6-Stage Minimum-Invasion Elastic Solver,
-3-Way Isomorphic Equation AST Compiler, Standalone OWPML (.hwpx) Synthesis,
-8-Format N-to-M Codec Hub (.hwp, .hwpx, .docx, .md, .csv, .xlsx, .html, .pdf),
-and Security/Side-Effect Hardening ([SEC-01] ~ [SEC-06]).
+SADT (Stella Actuation Document Transfer) v4.1.0 MCP Server Package.
+Powered by Topological Document Intermediate Representation (T-DIR) for structure-preserving
+conversion across HWP v5.0 (.hwp), OWPML (.hwpx), OOXML (.docx / .xlsx), HTML5, PDF 1.4, Markdown, and CSV,
+with non-whitespace SHA-256 text verification, dynamic file/template spec extraction,
+user spec override priority, a 6-stage Minimum-Invasion Elastic Solver,
+a 3-Way Equation AST converter, standalone .hwpx package synthesis,
+and defensive parsing/validation checks ([SEC-01] ~ [SEC-06]).
 """
 
 from .ir_schema import (
@@ -31,7 +32,7 @@ from .ir_schema import (
     compile_equation_ast_to_linear_text,
 )
 from .elastic_solver import ElasticLayoutState, MinimumInvasionElasticSolver
-from .mcp_server import TdirBetaMcpServer
+from .mcp_server import TdirBetaMcpServer, SadtMcpServer
 
 __all__ = [
     "TextRunIR",
@@ -58,5 +59,6 @@ __all__ = [
     "ElasticLayoutState",
     "MinimumInvasionElasticSolver",
     "TdirBetaMcpServer",
+    "SadtMcpServer",
 ]
-__version__ = "4.0.0"
+__version__ = "4.1.0"

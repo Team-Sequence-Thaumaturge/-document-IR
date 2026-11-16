@@ -1,0 +1,13 @@
+# Smithery MCP Server Configuration
+startCommand:
+  type: stdio
+  configSchema:
+    type: object
+    properties: {}
+  commandFunction: |-
+    (config) => ({
+      command: "python",
+      args: ["mcp_server.py"],
+      env: {}
+    })
+  exampleConfig: {}

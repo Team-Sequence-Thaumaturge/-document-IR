@@ -1,0 +1,49 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.Team-Sequence-Thaumaturge/sadt-mcp",
+  "title": "SADT — HWP, HWPX & Office Document Transfer MCP",
+  "description": "Zero-dependency Python MCP server (Stella Actuation Document Transfer) for converting and fitting HWP v5.0 (.hwp), HWPX (.hwpx), Word (.docx), Excel (.xlsx), HTML, PDF, Markdown, and CSV documents while preserving structure and equations.",
+  "version": "4.1.0",
+  "repository": {
+    "url": "https://github.com/Team-Sequence-Thaumaturge/-document-IR",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "sadt-mcp",
+      "version": "4.1.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "runtimeHint": "uvx",
+      "runtimeArguments": [
+        "--from",
+        "git+https://github.com/Team-Sequence-Thaumaturge/-document-IR",
+        "sadt-mcp"
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "name": "tdir_probe_files",
+      "description": "Inspect source documents (.docx, .hwp, .hwpx, .md, .csv, .xlsx, .html) and target HWP template geometry, typography, and slots dynamically."
+    },
+    {
+      "name": "tdir_build_mapping_plan",
+      "description": "Resolve effective typography and page-budget specifications, map source sections to template slots, and preview elastic layout stages."
+    },
+    {
+      "name": "tdir_execute_conversion",
+      "description": "Convert documents across HWP, HWPX, DOCX, XLSX, HTML, PDF, Markdown, and CSV using resolved layout constraints."
+    },
+    {
+      "name": "tdir_verify_fidelity_and_layout",
+      "description": "Check non-whitespace SHA-256 text consistency across generated formats and verify page counts via MS Word COM, LibreOffice, or built-in PDF 1.4 output."
+    },
+    {
+      "name": "tdir_adjust_block_layout",
+      "description": "Fine-tune individual paragraph merge locks or table column widths and refresh layout telemetry."
+    }
+  ]
+}

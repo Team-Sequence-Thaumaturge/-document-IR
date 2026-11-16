@@ -1,12 +1,12 @@
 """
-T-DIR v4.0.0 13-Cohort Parametric Regression Experiment Suite (EXP-01 ~ EXP-13).
+SADT (Stella Actuation Document Transfer / T-DIR v4.1.0) 14-Cohort Parametric Regression Suite (EXP-01 ~ EXP-14).
 Validates universal document intermediate representation, unsupervised heading spectrum detection,
 generalized template slot & 2RxC media grid scanning, numerical page-budget allocation,
 6-stage MinimumInvasionElasticSolver, standalone OWPML (.hwpx) synthesis & lifting,
-3-Way Isomorphic Equation AST compilation (OMML <-> HWP EQN <-> LaTeX),
+3-Way Equation AST compilation (OMML <-> HWP EQN <-> LaTeX),
 bidirectional OpenXML Spreadsheet (.xlsx) & Semantic HTML5 DOM (.html) codecs,
-deterministic pure-Python PDF 1.4 projection & 3-tier verification,
-and full security/side-effect hardening ([SEC-01] ~ [SEC-06]).
+pure-Python PDF 1.4 projection & 3-tier verification, security checks ([SEC-01] ~ [SEC-06]),
+standalone CLI bootstrap, PEP 621 packaging metadata, and GEO/MCP discovery manifests.
 """
 
 import os
@@ -16,11 +16,13 @@ import json
 import zlib
 import struct
 import zipfile
+import tomllib
+import subprocess
 
 sys.stdout.reconfigure(encoding="utf-8")
 sys.path.insert(0, r"c:\Users\stella\Desktop\stella test")
 
-from tdir_mcp_beta.mcp_server import TdirBetaMcpServer, handle_jsonrpc_request
+from tdir_mcp_beta.mcp_server import TdirBetaMcpServer, SadtMcpServer, handle_jsonrpc_request
 from tdir_mcp_beta.ir_schema import (
     detect_image_format,
     compute_heading_slot_similarity,
@@ -940,14 +942,80 @@ def run_exp13_security_and_idempotence_cohort(srv: TdirBetaMcpServer, real_job_i
     }
 
 
+def run_exp14_sadt_packaging_and_geo_manifest_cohort() -> dict:
+    """
+    EXP-14 (v4.1.0): Validates standalone `python mcp_server.py` stdio JSON-RPC startup from repo root,
+    PEP 621 packaging metadata (`pyproject.toml`), MCP Registry (`server.json`), Smithery (`smithery.yaml`),
+    and GEO manifests (`llms.txt`, `llms-full.txt`).
+    """
+    assert SadtMcpServer is TdirBetaMcpServer
+    repo_dir = os.path.dirname(os.path.abspath(__file__))
+
+    clean_env = {k: v for k, v in os.environ.items() if k.upper() != "PYTHONPATH"}
+    proc = subprocess.run(
+        [sys.executable, "mcp_server.py"],
+        cwd=repo_dir,
+        env=clean_env,
+        input='{"jsonrpc":"2.0","id":99,"method":"initialize","params":{}}\n',
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    init_out = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert init_out["result"]["serverInfo"] == {"name": "sadt-mcp", "version": "4.1.0"}, init_out
+
+    pyproject_path = os.path.join(repo_dir, "pyproject.toml")
+    with open(pyproject_path, "r", encoding="utf-8") as f_pp:
+        pyproject_data = tomllib.loads(f_pp.read())
+    assert pyproject_data["project"]["name"] == "sadt-mcp"
+    assert pyproject_data["project"]["version"] == "4.1.0"
+    scripts = pyproject_data["project"]["scripts"]
+    assert "sadt-mcp" in scripts and "sadt" in scripts and "tdir-mcp" in scripts
+
+    server_json_path = os.path.join(repo_dir, "server.json")
+    with open(server_json_path, "r", encoding="utf-8") as f_sj:
+        server_meta = json.load(f_sj)
+    assert server_meta["version"] == "4.1.0"
+    expected_tools = {
+        "tdir_probe_files",
+        "tdir_build_mapping_plan",
+        "tdir_execute_conversion",
+        "tdir_verify_fidelity_and_layout",
+        "tdir_adjust_block_layout",
+    }
+    listed_tools = {t["name"] for t in server_meta.get("tools", [])}
+    assert expected_tools == listed_tools, f"Mismatch tools in server.json: {listed_tools}"
+
+    for geo_name in ("llms.txt", "llms-full.txt"):
+        geo_path = os.path.join(repo_dir, geo_name)
+        with open(geo_path, "r", encoding="utf-8") as f_geo:
+            geo_txt = f_geo.read()
+        assert len(geo_txt.strip()) > 200
+        assert "SADT" in geo_txt and "uvx" in geo_txt, f"Missing SADT/uvx markers in {geo_name}"
+
+    smithery_path = os.path.join(repo_dir, "smithery.yaml")
+    with open(smithery_path, "r", encoding="utf-8") as f_sm:
+        sm_txt = f_sm.read()
+    assert "stdio" in sm_txt and "mcp_server.py" in sm_txt
+
+    return {
+        "standalone_cli_server_info": init_out["result"]["serverInfo"],
+        "pyproject_name": pyproject_data["project"]["name"],
+        "pyproject_version": pyproject_data["project"]["version"],
+        "console_scripts": sorted(scripts.keys()),
+        "server_json_tools_count": len(listed_tools),
+        "geo_manifests_verified": ["llms.txt", "llms-full.txt", "server.json", "smithery.yaml"],
+    }
+
+
 def main() -> None:
     os.makedirs(REGRESSION_OUT_DIR, exist_ok=True)
-    srv = TdirBetaMcpServer()
+    srv = SadtMcpServer()
 
     init_resp = handle_jsonrpc_request(srv, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
-    assert init_resp["result"]["serverInfo"]["version"] == "4.0.0"
+    assert init_resp["result"]["serverInfo"] == {"name": "sadt-mcp", "version": "4.1.0"}
 
-    print("=== RUNNING T-DIR v4.0.0 13-COHORT PARAMETRIC REGRESSION MATRIX (EXP-01 ~ EXP-13) ===")
+    print("=== RUNNING SADT (T-DIR v4.1.0) 14-COHORT PARAMETRIC REGRESSION MATRIX (EXP-01 ~ EXP-14) ===")
     res_01 = run_exp01_hierarchy_and_heading_spectrum_cohort(srv)
     print(f"[EXP-01 PASS] Hierarchy & Heading Spectrum: {json.dumps(res_01, ensure_ascii=False)}")
 
@@ -991,7 +1059,10 @@ def main() -> None:
     res_13 = run_exp13_security_and_idempotence_cohort(srv, res_01["real_job_id"])
     print(f"[EXP-13 PASS] Security Hardening ([SEC-01]~[SEC-06]) & Idempotence: {json.dumps(res_13, ensure_ascii=False)}")
 
-    print("\n=== ALL 13 PARAMETRIC REGRESSION COHORTS (EXP-01 ~ EXP-13) PASSED (100.00% FIDELITY & ZERO OPEN ITEMS) ===")
+    res_14 = run_exp14_sadt_packaging_and_geo_manifest_cohort()
+    print(f"[EXP-14 PASS] SADT Packaging, Standalone CLI & GEO Manifests: {json.dumps(res_14, ensure_ascii=False)}")
+
+    print("\n=== ALL 14 PARAMETRIC REGRESSION COHORTS (EXP-01 ~ EXP-14) PASSED ===")
 
 
 if __name__ == "__main__":

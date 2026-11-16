@@ -1,110 +1,164 @@
-# T-DIR (`document-IR`) — Topological Document Intermediate Representation MCP Server
+# SADT (Stella Actuation Document Transfer) — HWP · HWPX · DOCX Document MCP Server
 
-**[last patch : 2026-11-09 02:25:00 UTC]**
+**[last patch : 2026-11-16 07:43:00 UTC]**
 
-🌐 **[English (./README.md)](./README.md)** | 🇰🇷 **[한국어 (./README_KO.md)](./README_KO.md)**
+🌐 **[English (./README.md)](./README.md)** | 🇰🇷 **[한국어 (./README_KO.md)](./README_KO.md)** | 🤖 **[Agent Summary (./llms.txt)](./llms.txt)** | 📋 **[MCP Manifest (./server.json)](./server.json)**
 
 > [!NOTE]
-> **Production-Hardened Release (`v4.0.0`) — Active Engineering Notice**
-> This repository implements the full `v4.0.0` Topological Document Intermediate Representation (`T-DIR`) architecture across 8 document formats (`.hwp`, `.hwpx`, `.docx`, `.md`, `.csv`, `.xlsx`, `.html`, `.pdf`), including standalone `.hwpx` package synthesis with binary image injection, 3-Way Isomorphic Equation AST compilation (`OMML` $\leftrightarrow$ `HWP EQN` $\leftrightarrow$ `LaTeX`), 3-tier cross-platform PDF verification, and complete security/idempotence hardening (`[SEC-01]` ~ `[SEC-06]`). While all 13 parametric regression cohorts (`EXP-01` ~ `EXP-13`) pass with 100.00% `SHA-256` text immutability and zero open items, continuous validation against newly emerging third-party template conventions remains ongoing.
+> **Active Open-Source Release (`v4.1.0`) — Capabilities & Current Scope**
+> SADT (powered by the **T-DIR** Topological Document Intermediate Representation engine) is under active development. All 8 target formats (`.hwp`, `.hwpx`, `.docx`, `.xlsx`, `.html`, `.pdf`, `.md`, `.csv`), standalone `.hwpx` packaging, 3-Way Equation AST conversion, defensive archive validation (`[SEC-01]` ~ `[SEC-06]`), and 14 parametric regression cohorts (`EXP-01` ~ `EXP-14`) pass in our test suite. However, highly customized legacy macros, encrypted DRM files, or complex free-form vector objects may still require manual review after conversion.
 
 ---
 
-## 1. Overview & Motivation
+## 1. What SADT Does (In 30 Seconds)
 
-**T-DIR (Topological Document Intermediate Representation)** is a Model Context Protocol (MCP) server and document transformation engine designed to bridge structural, mathematical, and layout incompatibilities across Korean government/enterprise document formats (**HWP v5.0 Binary `.hwp`**, **OWPML `.hwpx`**) and global document formats (**OOXML `.docx`**, **OpenXML Spreadsheet `.xlsx`**, **Semantic HTML5 `.html`**, **PDF 1.4 `.pdf`**, **Markdown `.md`**, **CSV/TSV `.csv`/`.tsv`**).
+**SADT (Stella Actuation Document Transfer)** is a **zero-dependency Python MCP server and multi-format document engine** built for Korean `.hwp` (v5.0 binary), `.hwpx` (OWPML), MS Word (`.docx`), Excel (`.xlsx`), HTML5 (`.html`), PDF 1.4 (`.pdf`), Markdown (`.md`), and CSV/TSV transformations without requiring Hancom Office or LibreOffice.
 
-### Why Traditional 1:1 Document Converters Fail
-1. **Box-Model & Coordinate Unit Discrepancies**: Direct translation between `HWPUNIT` ($1\text{ pt} = 100\text{ HU}$), `Twips` ($1\text{ pt} = 20\text{ dxa}$), `EMU` ($1\text{ HU} = 127\text{ EMU}$), and CSS pixels fails when nested tables have asymmetric cell margins, merged spans (`gridSpan` / `vMerge`), or empty decorative spacer columns.
-2. **Line-Grid Snap Inflation (`snapToGrid`)**: Fonts with large vertical bounding boxes trigger line-grid snapping in MS Word (`w:lineRule="auto"`), inflating body text height per line and causing content to overflow fixed-page form templates.
-3. **Rigid Form Template Boundaries**: Official Korean business plan and grant templates (`.hwp`) wrap each section inside outer layout tables (`SLOT 01..M`) and place media attachments in bottom `2R x C` periodic grid slots (`MEDIA 01..P`). Naive copy-pasting breaks outer table borders, duplicates headers across pages, or truncates overflowing text.
-4. **LLM Context & Token Overhead**: Feeding tens of thousands of lines of raw OOXML (`word/document`) or OWPML (`Contents/section0`) XML into an LLM wastes context window tokens and risks accidental text hallucination or omission.
+### Common Problems It Solves
+- **"How do I parse or generate Korean `.hwp` / `.hwpx` files in Python without installing Hancom Office?"**  
+  SADT includes a pure-Python MS-CFB OLE2 reader/writer ([`./cfb_ole2.py`](./cfb_ole2.py)) and HWP v5.0 / OWPML codecs ([`./codec_hwp_v5.py`](./codec_hwp_v5.py), [`./codec_ooxml_owpml.py`](./codec_ooxml_owpml.py)) using only the Python standard library.
+- **"How can an AI agent fill an official HWP government or grant form without breaking outer tables or overflowing page limits?"**  
+  Instead of dumping giant XML files into an LLM prompt, SADT scans template slots (`SLOT 01..M`) and `2R x C` media grids (`MEDIA 01..P`) dynamically, fits sections to page budgets using a 6-stage `MinimumInvasionElasticSolver`, and verifies text preservation with non-whitespace `SHA-256` hashing.
+- **"How do I keep formulas and merged tables intact across Word, HWP, Markdown, Excel, and HTML?"**  
+  SADT preserves nested/merged grid structures and translates equations across Word `OMML`, Hancom `HWP EQN`, and `LaTeX` through a unified Equation AST compiler ([`./ir_schema.py`](./ir_schema.py)).
 
 ---
 
-## 2. Core Architecture & Zero-Hardcoding Numerical Resolution (`v4.0.0`)
+## 2. Quickstart (`uvx`, `pip`, or Direct Execution)
 
-T-DIR separates **content semantics**, **dynamic specification resolution**, **unsupervised heading/slot topology**, **3-Way Equation AST isomorphism**, **numerical page-budget allocation**, and **physical metric projection** into strictly isolated layers with **zero hardcoded font names, pixel/HWPUNIT constants, section IDs (`Q1..Q4`), page counts (`8 pages` / `2 pages`), or document-specific strings**:
+**Repository URL**: [Team-Sequence-Thaumaturge/-document-IR](https://github.com/Team-Sequence-Thaumaturge/-document-IR) (see [`./llms.txt`](./llms.txt) or [`./server.json`](./server.json) for the remote `git+https` `uvx` manifest snippet).
+
+### Option A — Run via `uvx` or `pip` (Zero External Dependencies)
+Clone the repository linked above, then install or launch `sadt-mcp` directly via `uvx` or `pip`:
+
+```bash
+git clone <repository-url>
+cd -document-IR
+
+# Launch MCP stdio server directly with uvx
+uvx --from . sadt-mcp
+
+# Or install locally with pip and run the CLI entrypoint
+pip install -e .
+sadt-mcp
+
+# Or run standalone with Python 3.10+
+python mcp_server.py
+```
+
+Add `sadt-mcp` to Claude Desktop, Cursor, Windsurf, or Antigravity MCP settings:
+
+```json
+{
+  "mcpServers": {
+    "sadt-mcp": {
+      "command": "uvx",
+      "args": ["--from", "/path/to/-document-IR", "sadt-mcp"]
+    }
+  }
+}
+```
+
+> [!TIP]
+> You can also run without cloning by passing the `git+https` repository URL from [`./llms.txt`](./llms.txt) as the `--from` argument to `uvx` or `pip install`.
+
+---
+
+## 3. Comparison with Common Document Tools
+
+| Feature | **SADT (`sadt-mcp`)** | `pyhwp` / `olefile` | `pandoc` | `python-docx` |
+| :--- | :--- | :--- | :--- | :--- |
+| **Pure-Python HWP v5.0 Read & Write** | Read + Write (`CFBArchive`) | Mainly Read / Extract | Not supported | Not supported |
+| **Standalone `.hwpx` Synthesis** | Supported (`<hp:pic>`, `BinData`) | Not supported | Not supported | Not supported |
+| **Multi-Format Coverage** | 8 formats (`.hwp`, `.hwpx`, `.docx`, `.xlsx`, `.html`, `.pdf`, `.md`, `.csv`) | HWP focus | Text / DOCX / HTML / LaTeX | `.docx` only |
+| **3-Way Equation AST Translation** | `OMML` $\leftrightarrow$ `HWP EQN` $\leftrightarrow$ `LaTeX` | Limited | No HWP equation support | Raw XML / manual |
+| **Template Slot & Page-Budget Fitting** | Unsupervised scanner + 6-stage solver | Not included | Not included | Not included |
+| **Native MCP (`stdio`) Integration** | Built-in (`5` tools + JSON-RPC 2.0) | CLI / Python API only | CLI only | Python API only |
+| **External Dependencies** | Zero (Python 3.10+ stdlib only) | External dependencies | Haskell binary | `lxml` |
+
+---
+
+## 4. Architecture Overview (Zero Hardcoded Document Rules)
+
+SADT separates **content topology**, **specification priority resolution**, **equation AST compilation**, **numerical page-budget allocation**, and **format projection** so no font name, paper size, section title (`Q1..Q4`), or page count is hardcoded in the engine:
 
 ```mermaid
 flowchart LR
-    A["8-Format Source & Target Files<br/>(.docx, .hwp, .hwpx, .md, .csv, .xlsx, .html)"] --> B["Layer 1: Unsupervised Heading Spectrum,<br/>3-Way Equation AST & Slot/Media Grid Scanner"]
+    A["8-Format Input Files<br/>(.docx, .hwp, .hwpx, .md, .csv, .xlsx, .html)"] --> B["Layer 1: Unsupervised Heading Spectrum,<br/>3-Way Equation AST & Slot/Media Grid Scanner"]
     U["User MCP Spec Overrides<br/>(UserSpecOverrideIR)"] --> C["Priority Spec & Numerical<br/>Page-Budget Resolver"]
     B --> C
     C --> D["Layer 2: 2D Grid Normalizer &<br/>6-Stage Elastic Solver (Early-Stop)"]
     D --> E["Layer 3: 8-Format Projectors<br/>(.hwp, .hwpx, .docx, .md, .csv, .xlsx, .html, .pdf)"]
-    E --> F["Cryptographic & 3-Tier PDF Verifier<br/>(Non-Whitespace SHA-256 + 3-Tier PDF Pages)"]
+    E --> F["Consistency & Layout Verifier<br/>(Non-Whitespace SHA-256 + 3-Tier PDF Check)"]
 ```
 
-### 2.1. 3-Tier Specification Priority Resolution
-Instead of hardcoding fonts, font sizes, or page dimensions, T-DIR extracts physical specifications from both the target template and source document at runtime and resolves them against explicit user MCP overrides ([`./ir_schema.py`](./ir_schema.py)):
+### 4.1. 3-Tier Specification Priority Resolution
+Runtime formatting, font families, font sizes, margins, and paper sizes are resolved using the priority rule in [`./ir_schema.py`](./ir_schema.py):
 
 $$\text{EffectiveSpec} = \text{Priority 1 }(\text{UserSpecOverrideIR}) \succ \text{Priority 2 }(\text{TargetDocumentSpecIR}) \succ \text{Priority 3 }(\text{SourceDocumentSpecIR})$$
 
-1. **Priority 1 — `UserSpecOverrideIR` (Explicit User MCP Specification)**: Explicit formatting, typography (body font family, table font family, body font size in points, table font size in points), line spacing percentage bounds, page geometry (page width, height, and margins in millimeters), total document page limit, per-section page budgets, outer table preservation policy, micro-typography scaling toggle, and attachment captions passed by the user or agent via MCP tool calls.
-2. **Priority 2 — `TargetDocumentSpecIR` ([`./codec_hwp_v5.py`](./codec_hwp_v5.py))**: Dynamically extracted from the target template's binary streams:
-   - `DocInfo` stream: `Tag 19` (UTF-16LE font families), `Tag 21` (character shape font sizes in `HU` and RGB colors), and `Tag 25` (paragraph shape line spacing percentages).
-   - `Section0..SectionN` streams: `Tag 73` (page definition width, height, and margins in `HU`), preamble/cover blocks, generalized `NxM` section container tables (`SLOT 01..M` with ordinal index), and generalized `2R x C` periodic alternating media grids (`MEDIA 01..P`).
-3. **Priority 3 — `SourceDocumentSpecIR` ([`./codec_ooxml_owpml.py`](./codec_ooxml_owpml.py))**: Dynamically extracted from the source document (`.docx`, `.hwpx`, or `.hwp`), providing fallback prose/table font families and sizes when the target template's body cells are empty placeholders.
+1. **Priority 1 — `UserSpecOverrideIR`**: Explicit user or agent constraints passed through MCP calls (body/table font families and point sizes, line spacing min/max percentages, page dimensions and margins in millimeters, total page limit, per-section page budgets, outer table policy, and attachment captions).
+2. **Priority 2 — `TargetDocumentSpecIR` ([`./codec_hwp_v5.py`](./codec_hwp_v5.py))**: Dynamically extracted from the target HWP template binary streams (`DocInfo` font/char/para records `Tag 19`, `Tag 21`, `Tag 25` and `Section0..SectionN` page definitions `Tag 73`, cover/preamble blocks, `NxM` container tables `SLOT 01..M`, and alternating `2R x C` media grids `MEDIA 01..P`).
+3. **Priority 3 — `SourceDocumentSpecIR` ([`./codec_ooxml_owpml.py`](./codec_ooxml_owpml.py))**: Dynamically extracted from `.docx`, `.hwpx`, or `.hwp` source documents as fallback typography when template cells contain empty placeholders.
 
-### 2.2. Unsupervised Heading Spectrum & Generalized Slot Topology (`[NUM-01]` ~ `[NUM-03]`)
-- **Unsupervised Top-Level Section Detector (`[NUM-01]`)**: Computes the statistical mode body font size $S_{\text{mode}}$ across paragraphs and detects top-level sections (`SEC 01..K`, `PREAMBLE`, `REFERENCES`) via OOXML outline levels (`outlineLvl == 0` / `Heading1`), structural chapter/ordinal prefixes (`제1장`, `I.`, `Ⅰ.`, `Chapter 1`, `Q1.`), or typographic font-size jumps ($\ge S_{\text{mode}} + 150\text{ HU}$ bold) without hardcoded title strings.
-- **Topological Ordinal Prefix Notice Filter (`[NUM-01]`)**: Automatically filters out unnumbered pre-section instruction/notice boxes preceding the first ordinal-1 section slot table (`SlotSpecIR`) without matching hardcoded strings like `"작성 요령"`.
-- **Universal Section Selector Matcher (`[NUM-02]`)**: `UserSpecOverrideIR` selectors accept generic section IDs (`SEC 01`), target slot IDs (`SLOT 01`), ordinal indices (`1`, `"2"`), or heading title substrings (`"Q1"`, `"제1장"`, `"Executive Summary"`), with zero default excluded sections.
-- **Generalized $2R \times C$ Periodic Media Grid Scanner (`[NUM-03]`)**: Detects any even-row $2R \times C$ table ($R \ge 1, 1 \le C \le 4$) where even rows are tall image cells ($H_{2r} \ge 3000\text{ HU}$) and odd rows are compact caption cells ($H_{2r} \ge 2 \cdot H_{2r+1}$), emitting `MEDIA 01..P` (`SlotSpecIR`).
+### 4.2. Unsupervised Section & Generalized Media Grid Topology
+- **Unsupervised Top-Level Section Detector**: Estimates the statistical mode body font size $S_{\text{mode}}$ across paragraphs and identifies sections (`SEC 01..K`, `PREAMBLE`, `REFERENCES`) via outline levels, multilingual structural prefixes (`제1장`, `I.`, `Ⅰ.`, `Chapter 1`, `Q1.`), or bold typographic size jumps ($\ge S_{\text{mode}} + 150\text{ HU}$).
+- **Universal Section Selector Matcher**: `UserSpecOverrideIR` accepts generic IDs (`SEC 01`), slot IDs (`SLOT 01`), ordinal indices (`1`, `"2"`), or title substrings without any hardcoded document-specific exclusions.
+- **Generalized $2R \times C$ Media Grid Scanner**: Detects even-row grid tables ($R \ge 1, 1 \le C \le 4$) where image rows ($H_{2r} \ge 3000\text{ HU}$) alternate with compact caption rows ($H_{2r} \ge 2 \cdot H_{2r+1}$), registering `MEDIA 01..P` (`SlotSpecIR`).
 
-### 2.3. Numerical Page-Budget Allocation Solver & 6-Stage Elastic Solver (`[NUM-04]`)
-- **Physical Box-Model Page Capacity**: Computes effective page body height directly from resolved `TargetDocumentSpecIR` page geometry ($84,188\text{ HU} - 2,800\text{ HU} - 2,800\text{ HU} = 78,588\text{ HU}$ on standard A4) without empirical magic multipliers.
-- **Autonomous Page-Budget Solver ([`./elastic_solver.py`](./elastic_solver.py))**: Numerically resolves per-section page budgets $B_k$ and expected total document pages ($P_{\text{expected}} = P_{\text{preamble}} + P_{\text{body}} + P_{\text{unmapped}} + P_{\text{media}}$) from the total page limit, explicit section budgets, or natural Stage-2 content heights using largest-remainder proportional allocation.
-- **6-Stage Minimum-Invasion Elastic Layout Solver (`MinimumInvasionElasticSolver`)**: Executes a progressive 6-stage loop (**Stage 1** spacers $\to$ **Stage 2** line-spacing interpolation $\to$ **Stage 3** subheading inline lead-in $\to$ **Stage 4** shortest table cell pair merge $\to$ **Stage 5** shortest body continuation merge $\to$ **Stage 6** optional micro-typography scaling) and stops immediately (`Early-Stop`) once the resolved budget $B_k$ is satisfied.
+### 4.3. Elastic Layout & Multi-Format Codecs
+- **6-Stage `MinimumInvasionElasticSolver` ([`./elastic_solver.py`](./elastic_solver.py))**: Adjusts section content smoothly across progressive stages (**Stage 1** empty spacer cleanup $\to$ **Stage 2** line-spacing interpolation $\to$ **Stage 3** standalone subheading inline lead-in $\to$ **Stage 4** shortest table cell paragraph pair merge $\to$ **Stage 5** shortest body continuation merge $\to$ **Stage 6** optional `-0.5pt` font scaling) and stops immediately once the resolved page budget is met.
+- **Standalone OWPML (`.hwpx`) Package Synthesis & Lifting**: Generates compliant `.hwpx` archives (`mimetype`, `META-INF/container`, `Contents/content`, `Contents/header`, `Contents/section0`) with injected `<hp:pic>` / `Contents/BinData/` media even without a base `.hwpx` file, and lifts existing `.hwpx` files back into `SectionIR`.
+- **3-Way Equation AST Compiler**: Parses and compiles mathematical expressions across Word `OMML` (`<m:oMath>`), Hancom `HWP EQN` (`Tag 105` in `.hwp` and `<hp:equation>` in `.hwpx`), and `LaTeX` (`$...$` / `$$...$$` in Markdown and `<math data-latex="...">` in HTML).
+- **Bidirectional `.xlsx` & `.html` + Pure-Python `.pdf`**: Supports shared strings, `<mergeCells>`, `rowspan`/`colspan`, base64 media, and built-in multi-page PDF 1.4 rendering with Type0/CIDFontType2 UTF-16BE (`<FEFF...>`) CJK strings paired with 3-tier PDF inspection (**Tier 1** MS Word COM $\to$ **Tier 2** LibreOffice $\to$ **Tier 3** Built-in PDF 1.4).
 
-### 2.4. `v4.0.0` Core Advancements & Security Hardening (`[P2-01]` ~ `[P3-02]`, `[SEC-01]` ~ `[SEC-06]`)
-1. **Standalone OWPML (`.hwpx`) Package Synthesis & Bidirectional Lifting (`[P2-01]`)**: Generates standards-compliant `.hwpx` packages from scratch without any reference `.hwpx` file (`mimetype`, `META-INF/container`, `Contents/content`, `Contents/header`, `Contents/section0`), injects binary images (`<hp:pic>` + `<hc:img>` + `Contents/BinData/`), and lifts `.hwpx` files back into `SectionIR`.
-2. **3-Way Isomorphic Equation AST Compiler (`[P2-02]`)**: Losslessly parses and compiles mathematical formulas across **MS Word OMML** (`<m:oMath>`), **Hancom Equation Script** (`Tag 105` in `.hwp` and `<hp:equation>` in `.hwpx`), and **LaTeX** (`$...$` / `$$...$$` in `.md` and `<math data-latex="...">` in `.html`) via a unified recursive-descent AST (`frac`, `sqrt`, `sup`, `sub`, `subsup`, `bigop`, `delim`, `matrix`, `sym`, `text`, `seq`).
-3. **Bidirectional OpenXML Spreadsheet (`.xlsx`) & Semantic HTML5 DOM (`.html`) Codecs (`[P3-01]`)**: Projects and lifts multi-section tables, shared string tables (`xl/sharedStrings`), cell styles (`xl/styles`), merged cell ranges (`<mergeCells>` / `rowspan` & `colspan`), and base64-encoded media.
-4. **Deterministic Pure-Python PDF 1.4 Projector & 3-Tier Cross-Platform Verifier (`[P3-02]`)**: Renders multi-page PDF 1.4 documents directly in pure Python with Type0/CIDFontType2 UTF-16BE (`<FEFF...>`) CJK strings and verifies page budgets across 3 tiers (**Tier 1**: Windows MS Word COM $\to$ **Tier 2**: Headless LibreOffice $\to$ **Tier 3**: Built-in Deterministic PDF 1.4 Layout & UTF-16BE Text Verifier).
-5. **Security & Side-Effect Hardening (`[SEC-01]` ~ `[SEC-06]`)**:
-   - `[SEC-01]` XML `DOCTYPE` / `ENTITY` (XXE & Billion Laughs) rejection and XML payload size ceiling (`64 MB`).
-   - `[SEC-02]` ZIP path traversal (`Zip-Slip` `../`) and decompression bomb ratio/size guard, plus bounded streaming `zlib` decompression in `.hwp` streams (`64 MB` ceiling).
-   - `[SEC-03]` MS-CFB header magic validation, directory entry cap (`8,192`), stream size ceiling (`128 MB`), and `visited` set cycle detection across `DIFAT`, `FAT`, and `MiniFAT` chains (`CFBArchive`).
-   - `[SEC-04]` Local filesystem path canonicalization, null-byte rejection, and Windows reserved device name filtering (`CON`, `PRN`, `AUX`, `NUL`, `COM1..9`, `LPT1..9`).
-   - `[SEC-05]` XML 1.0 illegal control-character stripping (`U+0000..U+001F` except `\t`, `\n`, `\r`) and Spreadsheet DDE/Formula Injection neutralization (`=`, `+`, `-`, `@` prefix escaping).
-   - `[SEC-06]` Deep-copy block isolation before elastic layout solving (`MinimumInvasionElasticSolver`) so repeated conversions on the same job ID remain 100% idempotent, paired with a 64-job LRU memory cache ceiling (`TdirBetaMcpServer`).
+### 4.4. Defensive Security & State Isolation Checks (`[SEC-01]` ~ `[SEC-06]`)
+- `[SEC-01]` Rejects XML `DOCTYPE` and `ENTITY` declarations (XXE defense) and enforces a `64 MB` XML input ceiling.
+- `[SEC-02]` Blocks ZIP traversal (`../`, drive prefixes), limits archive entries (`4,096`) and decompressed sizes (`64 MB`/entry, `256 MB` total), and uses bounded streaming `zlib` decompression in `.hwp` streams (`64 MB` ceiling).
+- `[SEC-03]` Checks MS-CFB headers, caps directory entries (`8,192`) and stream reads (`128 MB`), and tracks visited sectors across `DIFAT`, `FAT`, and `MiniFAT` chains (`CFBArchive`) to exit cyclic structures safely.
+- `[SEC-04]` Validates local paths against null bytes and Windows reserved device filenames.
+- `[SEC-05]` Strips illegal XML 1.0 control characters and prefixes leading spreadsheet formula symbols (`=`, `+`, `-`, `@`) with an apostrophe to mitigate DDE injection.
+- `[SEC-06]` Deep-copies `SectionIR.blocks` before solving so repeated runs on the same job remain repeatable, bounded by a `64`-job LRU cache (`TdirBetaMcpServer`).
 
 ---
 
-## 3. Repository Structure
+## 5. Repository Structure
 
 | Module Path | Description |
 | :--- | :--- |
-| [`./__init__.py`](./__init__.py) | Package initialization (`v4.0.0`) and exported classes (`TdirBetaMcpServer`, `MinimumInvasionElasticSolver`, `SourceDocumentSpecIR`, `TargetDocumentSpecIR`, `UserSpecOverrideIR`). |
-| [`./ir_schema.py`](./ir_schema.py) | T-DIR v4.0 data structures (`TextRunIR`, `ParagraphIR`, `TableCellIR`, `TableGridIR`, `MediaObjectIR`, `SectionIR`, `SlotSpecIR`, `SourceDocumentSpecIR`, `TargetDocumentSpecIR`, `UserSpecOverrideIR`, `ConversionJobIR`), 3-Way Equation AST compiler, security validators (`[SEC-01]`..`[SEC-05]`), unsupervised heading spectrum detector, and non-whitespace `SHA-256` verifier. |
-| [`./cfb_ole2.py`](./cfb_ole2.py) | Pure-Python MS-CFB (`CFBArchive` OLE2 Compound File Binary v3) reader and writer supporting 512B standard sectors, 64B mini-streams, `DIFAT`/`FAT`/`MiniFAT` cycle guards (`[SEC-03]`), fixed-point FAT allocation, automatic `BinData` storage creation, and balanced Red-Black directory trees. |
-| [`./elastic_solver.py`](./elastic_solver.py) | Pure topological 2D grid normalizers, numerical page-budget allocator, and `MinimumInvasionElasticSolver` 6-stage Early-Stop layout engine (`ElasticLayoutState`). |
-| [`./codec_hwp_v5.py`](./codec_hwp_v5.py) | HWP v5.0 binary record parser (bounded streaming decompression `[SEC-02]`, multi-section `Section0..SectionN`), `DocInfo` dynamic typography extractor, `Tag 105` equation control builder/parser (`[P2-02]`), UTF-16LE surrogate-pair safe `WCHAR` accounting, generalized `SLOT 01..M` and `2R x C` `MEDIA 01..P` scanner, lifter, and binary projector. |
-| [`./codec_ooxml_owpml.py`](./codec_ooxml_owpml.py) | OOXML (`.docx`) & OWPML (`.hwpx`) style/page scanners, unsupervised heading spectrum lifters, `<m:oMath>` OMML & `<hp:equation>` equation AST lifters/projectors, standalone `.docx` and standalone `.hwpx` package synthesizers (`[P2-01]`), `<hp:pic>` binary image injector, and `TargetDocumentSpecIR`-driven projectors. |
-| [`./codec_tabular_markup.py`](./codec_tabular_markup.py) | Bidirectional Markdown (`.md` with LaTeX `$...$`/`$$...$$` equations), CSV/TSV (`.csv`, `.tsv`), OpenXML Spreadsheet (`.xlsx` with `<mergeCells>` and DDE guard), Semantic HTML5 DOM (`.html` with `<math data-latex="...">` and base64 media), and deterministic pure-Python PDF 1.4 (`.pdf`) projectors and lifters. |
-| [`./mcp_server.py`](./mcp_server.py) | Standalone JSON-RPC 2.0 stdio MCP server (`TdirBetaMcpServer` / `tdir-document-beta` `v4.0.0`) exposing 5 tools, 8-format conversion, 3-tier cross-platform PDF verification, deep-copy job idempotence, and 64-job LRU eviction (`[SEC-06]`). |
-| [`./test_regression_suite.py`](./test_regression_suite.py) | **13-Cohort Parametric Regression Experiment Suite (`EXP-01` ~ `EXP-13`)** validating all document hierarchies, numerical page-budget sweeps, metric spaces, 2D table topologies, generalized template topologies, cross-format round-trips, Unicode/DIFAT stress, multi-source agent loops, standalone `.hwpx` synthesis, 3-Way Equation AST compilation, `.xlsx`/`.html` codecs, native `.pdf` verification, and `[SEC-01]`..`[SEC-06]` security hardening. |
+| [`./pyproject.toml`](./pyproject.toml) | PEP 621 zero-dependency packaging metadata (`sadt-mcp`) with `sadt-mcp`, `sadt`, and `tdir-mcp` CLI entrypoints. |
+| [`./server.json`](./server.json) | Official MCP Registry manifest describing server coordinates, `uvx` runtime hints, and exposed tools. |
+| [`./smithery.yaml`](./smithery.yaml) | Smithery `stdio` MCP launch configuration. |
+| [`./llms.txt`](./llms.txt) | Concise AI-crawler summary for Generative Engine Optimization (GEO). |
+| [`./llms-full.txt`](./llms-full.txt) | Detailed LLM and agent guide covering schemas, override parameters, comparisons, and scope boundaries. |
+| [`./__init__.py`](./__init__.py) | Package exports (`SadtMcpServer`, `TdirBetaMcpServer`, `MinimumInvasionElasticSolver`, `SourceDocumentSpecIR`, `TargetDocumentSpecIR`, `UserSpecOverrideIR`) at `v4.1.0`. |
+| [`./ir_schema.py`](./ir_schema.py) | Canonical IR dataclasses, 3-Way Equation AST compiler, security validators (`[SEC-01]`..`[SEC-05]`), heading spectrum detector, and non-whitespace `SHA-256` checker. |
+| [`./cfb_ole2.py`](./cfb_ole2.py) | Pure-Python MS-CFB (`CFBArchive` OLE2 Compound File Binary v3) reader/writer with cycle guards, `DIFAT` chain allocation, `BinData` synthesis, and Red-Black directory tree serialization. |
+| [`./elastic_solver.py`](./elastic_solver.py) | 2D table topology normalizer, numerical page-budget allocator, and 6-stage `MinimumInvasionElasticSolver`. |
+| [`./codec_hwp_v5.py`](./codec_hwp_v5.py) | HWP v5.0 binary record parser, `DocInfo` extractor, `Tag 105` equation codec, surrogate-pair safe `WCHAR` encoder, and generalized slot scanner/projector. |
+| [`./codec_ooxml_owpml.py`](./codec_ooxml_owpml.py) | OOXML (`.docx`) and OWPML (`.hwpx`) lifters, scanners, equation handlers, and standalone `.docx` / `.hwpx` projectors. |
+| [`./codec_tabular_markup.py`](./codec_tabular_markup.py) | Bidirectional Markdown, CSV/TSV, Excel (`.xlsx`), HTML5 (`.html`), and built-in PDF 1.4 projectors/inspectors. |
+| [`./mcp_server.py`](./mcp_server.py) | Standalone JSON-RPC 2.0 `stdio` MCP server (`SadtMcpServer` / `TdirBetaMcpServer` `sadt-mcp` `v4.1.0`) supporting direct script launch (`python mcp_server.py`) and package imports. |
+| [`./test_regression_suite.py`](./test_regression_suite.py) | **14-Cohort Parametric Regression Suite (`EXP-01` ~ `EXP-14`)** testing hierarchy detection, page budgets, metric scaling, table topology, round-trips, equations, security checks, and `uvx`/GEO packaging. |
 
 ---
 
-## 4. MCP Tools & `UserSpecOverrideIR` Schema
+## 6. MCP Tools & `UserSpecOverrideIR` Reference
 
-The server ([`./mcp_server.py`](./mcp_server.py)) communicates over standard JSON-RPC 2.0 (`stdio`) and exposes 5 tools:
+The server ([`./mcp_server.py`](./mcp_server.py)) communicates over JSON-RPC 2.0 (`stdio`) and exposes 5 tools:
 
 ```python
-# 1. Probe source documents (.docx, .hwp, .hwpx, .md, .csv, .tsv, .xlsx, .html) and target template dynamically
+# 1. Inspect source documents (.docx, .hwp, .hwpx, .md, .csv, .tsv, .xlsx, .html) & template
 tdir_probe_files(source_paths: list[str], target_path: str) -> dict
 
-# 2. Resolve effective spec, numerical page budgets, and preview 6-stage Elastic Solver
+# 2. Resolve specs, section-to-slot mapping, and page budgets
 tdir_build_mapping_plan(
     job_id: str,
     user_spec_overrides: dict | None = None,
     user_constraints: dict | None = None,
 ) -> dict
 
-# 3. Execute deterministic projection into ["hwp", "hwpx", "docx", "md", "csv", "xlsx", "html", "pdf"]
+# 3. Execute conversion into ["hwp", "hwpx", "docx", "md", "csv", "xlsx", "html", "pdf"]
 tdir_execute_conversion(
     job_id: str,
     output_prefix: str,
@@ -114,10 +168,10 @@ tdir_execute_conversion(
     user_spec_overrides: dict | None = None,
 ) -> dict
 
-# 4. Verify 100.00% non-whitespace SHA-256 text immutability and 3-tier PDF page budget compliance
+# 4. Run non-whitespace SHA-256 text consistency check and 3-tier PDF page-budget check
 tdir_verify_fidelity_and_layout(job_id: str, export_pdf: bool = True) -> dict
 
-# 5. Pinpoint adjustment of paragraph merge lock or table column widths with immediate solver preview refresh
+# 5. Fine-tune an individual paragraph merge lock or table column width array
 tdir_adjust_block_layout(
     job_id: str,
     section_uid: str,
@@ -127,9 +181,7 @@ tdir_adjust_block_layout(
 ) -> dict
 ```
 
-### Supported `UserSpecOverrideIR` Fields
-When calling Tool 2 or Tool 3, users or agents can pass the override dictionary to explicitly control typography, geometry, or numerical page budgets:
-
+### Example `UserSpecOverrideIR` Payload
 ```json
 {
   "body_font_family": "함초롬바탕",
@@ -138,70 +190,47 @@ When calling Tool 2 or Tool 3, users or agents can pass the override dictionary 
   "table_font_size_pt": 9.5,
   "body_line_spacing_min_pct": 122,
   "body_line_spacing_max_pct": 160,
-  "table_line_spacing_min_pct": 112,
-  "table_line_spacing_max_pct": 125,
   "page_width_mm": 210.0,
   "page_height_mm": 297.0,
   "margins_mm": {"top": 15.0, "bottom": 15.0, "left": 20.0, "right": 20.0},
   "total_page_limit": 8,
   "section_page_budgets": {"SEC_01": 2.0, "SEC_02": 2.0},
-  "exclude_sections": ["SEC_03"],
   "preserve_outer_tables": true,
   "route_media_to_attachment_slots": true,
   "max_attachment_images": 3,
-  "attachment_captions": [
-    "[붙임 1] 시스템 아키텍처 다이어그램",
-    "[붙임 2] 3단계 워크플로우 및 타겟 시장 로드맵"
-  ],
   "allow_font_size_elastic_scaling": false,
-  "clear_unmapped_slots": false,
   "style_inheritance_mode": "TARGET_FIRST"
 }
 ```
 
 ---
 
-## 5. Quickstart & Usage
+## 7. 14-Cohort Regression Suite ([`./test_regression_suite.py`](./test_regression_suite.py))
 
-### Prerequisites
-- Python 3.10+ (Zero external third-party pip dependencies required for all 8 formats `.hwp`, `.hwpx`, `.docx`, `.md`, `.csv`, `.xlsx`, `.html`, `.pdf`; uses Python standard library modules `zlib`, `struct`, `zipfile`, `hashlib`, `ElementTree`, `HTMLParser`).
-- Optional: Microsoft Word (on Windows) or LibreOffice (`soffice`) for Tier-1/Tier-2 PDF verification; Tier-3 built-in deterministic PDF 1.4 verification works out-of-the-box on all OS platforms with zero external binaries.
-
-### Running as an MCP Server
-Add `tdir-document-beta` to your MCP client configuration:
-
-```json
-{
-  "mcpServers": {
-    "tdir-document-beta": {
-      "command": "python",
-      "args": ["mcp_server.py"],
-      "cwd": "/path/to/-document-IR"
-    }
-  }
-}
-```
+| Cohort ID | Experiment Scope | Verified Result |
+| :--- | :--- | :--- |
+| **`EXP-01`** | Document hierarchy & unsupervised heading spectrum (`제1장..제3장`, `I..III`, bold size jumps, real proposal template) | `PASS` |
+| **`EXP-02`** | Numerical page-budget sweep (`3p` $\to$ `0` merges, auto `8` pages $\to$ `11` merges, `1p` $\to$ `108` merges, asymmetric `4:1` split) | `PASS` |
+| **`EXP-03`** | Continuous `HWPUNIT` scaling across `A4 Landscape` (`9pt`) and `B5 Portrait` (`13.5pt`) | `PASS` |
+| **`EXP-04`** | 2D table topology collapse (stair-step `5x4` $\to$ `3x3`, arrow folding `3x1` $\to$ `2x1`, `<w:sdt>` unwrap) | `PASS` |
+| **`EXP-05`** | Generalized `4x2` media grid discovery, automatic `BinData` creation, and slotless plain document mode | `PASS` |
+| **`EXP-06`** | N-to-M cross-format round-trips (`.docx` $\to$ `.md` and `.docx` $\to$ `.csv`) | `PASS` |
+| **`EXP-07`** | UTF-16LE surrogate-pair `WCHAR` accounting (`"A🚀B𝕏\r"`) and `7.2 MB` `DIFAT` sector chain round-trip | `PASS` |
+| **`EXP-08`** | Multi-source heterogeneous merge (`[.docx, .csv, .md]`) + Tool 5 block layout adjustment loop | `PASS` |
+| **`EXP-09`** | Standalone `.hwpx` synthesis (with binary `<hp:pic>` media injection) and `.hwpx` $\to$ `.hwp`/`.docx` round-trip | `PASS` |
+| **`EXP-10`** | 3-Way Equation AST compilation across `OMML`, `HWP EQN` (`Tag 105` / `<hp:equation>`), and `LaTeX` | `PASS` |
+| **`EXP-11`** | Bidirectional `.xlsx` (`106` rows, `<mergeCells>`) and `.html` (`rowspan`/`colspan`, base64 media) round-trips | `PASS` |
+| **`EXP-12`** | Built-in multi-page PDF 1.4 rendering (`8` pages) and UTF-16BE (`<FEFF...>`) text extraction consistency check | `PASS` |
+| **`EXP-13`** | Security checks (`[SEC-01]`..`[SEC-06]`): XXE rejection, `Zip-Slip` blocking, `MiniFAT` cycle guard, DDE escaping, idempotence | `PASS` |
+| **`EXP-14`** | Standalone `python mcp_server.py` `stdio` initialize check (`sadt-mcp` `v4.1.0`), PEP 621 packaging metadata, and GEO manifests | `PASS` |
 
 ---
 
-## 6. `v4.0.0` 13-Cohort Parametric Regression Matrix & Resolution Status
+## 8. Frequently Asked Questions (FAQ)
 
-### 6.1. Verified 13-Cohort Parametric Regression Matrix ([`./test_regression_suite.py`](./test_regression_suite.py))
-| Cohort ID | Experiment Scope | Verified Result |
-| :--- | :--- | :--- |
-| **`EXP-01`** | **Document Hierarchy & Unsupervised Heading Spectrum**: Korean Academic (`제1장..제3장`), English Roman (`I..III`), Unnumbered Font-Size-Jump (`14pt` vs `10pt`), and Real Grant Proposal (`SectionIR`, `SlotSpecIR`) | `PASS` |
-| **`EXP-02`** | **Numerical Page-Budget Sweep & Monotonicity**: Loose (`3p` $\to$ `0` merges), Autonomous 8-page limit (`2p` $\to$ `11` merges, exact `8` PDF pages), Tight (`1p` $\to$ `108` merges), and Asymmetric (`4:1` volume $\to$ `3p : 1p` allocation) | `PASS` |
-| **`EXP-03`** | **Metric Space & Typography Scaling**: Continuous `HWPUNIT` scaling across `A4 Landscape` (`84,189 x 59,528 HU` at `9pt`) and `B5 Portrait` (`51,591 x 72,850 HU` at `13.5pt`) | `PASS` |
-| **`EXP-04`** | **2D Table Topology Stress**: Stair-step sparse chart collapse (`5x4` $\to$ `3x3`), vertical step-arrow folding (`3x1` $\to$ `2x1`), `<w:sdt>` unwrapping, and HWP `Tag 77` row-column invariants | `PASS` |
-| **`EXP-05`** | **Generalized Template Topology**: Modified `4x2` (`4`-slot) periodic media grid discovery, automatic `BinData` storage creation, and slotless plain document projection | `PASS` |
-| **`EXP-06`** | **N-to-M Cross-Format Round-Trip**: `.docx` $\to$ `.md` (`6,149` non-ws chars) and `.docx` $\to$ `.csv` (`6,462` non-ws chars) round-trip lifting | `PASS` |
-| **`EXP-07`** | **Unicode Surrogate-Pair & Large CFB `DIFAT` Stress**: `7 WCHAR` UTF-16LE encoding for `"A🚀B𝕏\r"` in HWP `Tag 66`/`Tag 67` and `7,200,000 B` multi-sector `DIFAT` chain round-trip | `PASS` |
-| **`EXP-08`** | **Multi-Source Heterogeneous Merge & Agent Loop**: Simultaneous `[.docx, .csv, .md]` ingestion into `SlotSpecIR` slots with Tool 5 (`TdirBetaMcpServer`) paragraph lock & column width adjustment | `PASS` |
-| **`EXP-09`** | **Standalone OWPML (`.hwpx`) Synthesis & Bidirectional Lifting (`[P2-01]`)**: Standalone `.hwpx` package generation (`base_hwpx_path=None`) with `2` injected binary images (`<hp:pic>` + `Contents/BinData/`) and `.hwpx` $\to$ `.hwp`/`.docx` round-trip (`100.00%` `SHA-256`) | `PASS` |
-| **`EXP-10`** | **3-Way Isomorphic Equation AST (`[P2-02]`)**: Lossless AST compilation across Word `OMML` (`<m:oMath>`), Hancom `HWP EQN` (`Tag 105` & `<hp:equation>`), and `LaTeX` (`$...$` / `$$...$$`) with `2` verified `Tag 105` binary records | `PASS` |
-| **`EXP-11`** | **Bidirectional OpenXML Spreadsheet (`.xlsx`) & Semantic HTML5 DOM (`.html`) (`[P3-01]`)**: `106` rows, `7` `<mergeCells>` ranges, `125` shared strings in `.xlsx` and `rowspan`/`colspan` + base64 media in `.html` with full round-trip verification | `PASS` |
-| **`EXP-12`** | **Deterministic Pure-Python PDF 1.4 & 3-Tier Verifier (`[P3-02]`)**: Exact `8`-page PDF 1.4 rendering and UTF-16BE (`<FEFF...>`) text extraction (`6,401` non-ws chars, `100.00%` section text match) | `PASS` |
-| **`EXP-13`** | **Security Hardening & Multi-Run Job Idempotence (`[SEC-01]` ~ `[SEC-06]`)**: XXE entity blocking, `Zip-Slip` blocking, binary `MiniFAT` cycle termination, null-byte path rejection, DDE formula neutralization, and tight-then-loose (`108` $\to$ `0` merges) job idempotence | `PASS` |
-
-### 6.2. Open Items Status (`v4.0.0`)
-- **Open Architectural, Numerical, Codec, or Security Items**: **0 (All `P0`, `P1`, `P2`, `P3`, `NUM-01..04`, and `SEC-01..06` items resolved and verified).**
+- **Does SADT require Hancom Office or Microsoft Word to run?**  
+  No. Core conversion across `.hwp`, `.hwpx`, `.docx`, `.xlsx`, `.html`, `.pdf`, `.md`, and `.csv` runs purely with Python 3.10+ standard libraries on Windows, macOS, and Linux. External Word COM or LibreOffice is optional and used only when Tier-1 or Tier-2 PDF layout verification is desired; Tier-3 built-in PDF verification runs everywhere.
+- **Can I convert `.docx` or `.md` into `.hwp` without an `.hwpx` base file?**  
+  Yes. You can either project into an existing `.hwp` form template (`SLOT 01..M`) or synthesize a standalone `.hwpx` archive directly with no reference `.hwpx` input.
+- **How does SADT fit overflowing content into fixed-page templates?**  
+  After normalizing tables, the 6-stage `MinimumInvasionElasticSolver` incrementally tightens line spacing within user bounds, converts short standalone subheadings into inline lead-ins, and merges only minimal continuation blocks until the per-section page budget is met—preserving all source text characters checked via `SHA-256`.

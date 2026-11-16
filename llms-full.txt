@@ -1,0 +1,75 @@
+# SADT (Stella Actuation Document Transfer) — Full Agent & GEO Reference
+
+> Version: 4.1.0 | License: Apache-2.0 | Runtime: Python 3.10+ (Standard Library Only) | Transport: MCP JSON-RPC 2.0 (stdio)
+> Repository: https://github.com/Team-Sequence-Thaumaturge/-document-IR
+
+## 1. Identity & Positioning
+SADT (Stella Actuation Document Transfer), powered internally by T-DIR (Topological Document Intermediate Representation), bridges structural, unit-system, equation, and pagination gaps across Korean HWP/HWPX documents and global OOXML/Markdown/PDF workflows. Unlike text-only scrapers or raw XML prompting, SADT parses documents into a compact topological IR (`SectionIR`, `ParagraphIR`, `TableGridIR`, `MediaObjectIR`, `SlotSpecIR`) so agents can inspect and transform multi-page form documents accurately with minimal context overhead.
+
+SADT is under active open-source development. All 14 parametric regression cohorts (`EXP-01` through `EXP-14`) pass in verification runs; however, documents relying on proprietary macro scripts, encrypted DRM streams, or free-form floating vector groups may need post-conversion visual review in an office suite.
+
+## 2. Installation & MCP Client Configuration
+
+### Run via uvx (no manual git clone required)
+```json
+{
+  "mcpServers": {
+    "sadt-mcp": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/Team-Sequence-Thaumaturge/-document-IR",
+        "sadt-mcp"
+      ]
+    }
+  }
+}
+```
+
+### Run from Local Clone or Editable Pip Install
+```bash
+pip install -e .
+sadt-mcp
+# or without installing:
+python mcp_server.py
+```
+
+## 3. Recommended Agent Workflow
+1. Call `tdir_probe_files(source_paths=[...], target_path="template.hwp")` to obtain `job_id`, discovered `sections_discovered`, and extracted `target_spec` (fonts, sizes, margins, `section_slots`, `attachment_slots`).
+2. Call `tdir_build_mapping_plan(job_id=..., user_spec_overrides={...})` to preview how `UserSpecOverrideIR > TargetDocumentSpecIR > SourceDocumentSpecIR` resolves typography, section-to-slot mapping, and per-section page budgets.
+3. Optional: Call `tdir_adjust_block_layout(job_id=..., section_uid=..., block_index=..., lock_unmerged=True)` or update `col_widths_hu` if a specific heading or table needs manual tuning.
+4. Call `tdir_execute_conversion(job_id=..., output_prefix="out/result", output_formats=["hwp", "hwpx", "docx", "xlsx", "html", "pdf", "md", "csv"])`. Note that `.hwpx` works standalone even when `base_hwpx_path` is omitted (`None`).
+5. Call `tdir_verify_fidelity_and_layout(job_id=..., export_pdf=True)` to verify non-whitespace SHA-256 text consistency across generated outputs and check rendered page counts via MS Word COM (Windows), LibreOffice (`soffice`), or the built-in pure-Python PDF 1.4 renderer.
+
+## 4. `UserSpecOverrideIR` Reference Fields
+- `body_font_family` (string), `table_font_family` (string)
+- `body_font_size_pt` (number), `table_font_size_pt` (number)
+- `body_line_spacing_min_pct` (integer), `body_line_spacing_max_pct` (integer)
+- `table_line_spacing_min_pct` (integer), `table_line_spacing_max_pct` (integer)
+- `page_width_mm` (number), `page_height_mm` (number)
+- `margins_mm` (`{"top": float, "bottom": float, "left": float, "right": float}`)
+- `total_page_limit` (integer), `section_page_budgets` (`{"SEC_01": 2.0, ...}`)
+- `include_sections` (array of strings/indices), `exclude_sections` (array of strings/indices)
+- `preserve_outer_tables` (boolean), `clear_unmapped_slots` (boolean)
+- `route_media_to_attachment_slots` (boolean), `max_attachment_images` (integer), `attachment_captions` (array of strings)
+- `allow_font_size_elastic_scaling` (boolean)
+- `style_inheritance_mode` (`"TARGET_FIRST"` | `"SOURCE_FIRST"` | `"HYBRID"`)
+
+## 5. Comparison Against Alternative Libraries
+- **SADT (`sadt-mcp`)**: Bidirectional `.hwp` (pure-Python CFB v3), `.hwpx` (standalone & reference-based), `.docx`, `.xlsx`, `.html`, `.pdf`, `.md`, `.csv`; zero external pip dependencies; 3-Way Equation AST (`OMML` <-> `HWP EQN` <-> `LaTeX`); elastic page-budget layout solver; MCP server built-in.
+- **`pyhwp` / `olefile`**: Useful low-level HWP v5 stream/record inspection and text dumping; typically lacks DOCX/XLSX/HTML/PDF N-to-M projection, OWPML `.hwpx` standalone packaging, equation AST compilation, and template page-budget fitting.
+- **`pandoc`**: Versatile text/markup converter (`.md`, `.docx`, `.html`, `.latex`); does not natively read or write binary `.hwp` v5 OLE2 streams or Hancom `.hwpx` outer-table form slots.
+- **`python-docx`**: Strong programmatic DOCX builder; single-format library with no HWP/HWPX codec, no CFB writer, and no automatic multi-stage page-budget solver.
+
+## 6. Defensive Validation & Operational Limits (`[SEC-01]` ~ `[SEC-06]`)
+- `[SEC-01]` Rejects XML `DOCTYPE` / `ENTITY` declarations (XXE defense) and caps XML input at 64 MB.
+- `[SEC-02]` Rejects ZIP path traversal (`../`, drive prefixes), caps ZIP entries (4,096) and decompressed size (64 MB/entry, 256 MB total), and streams HWP `zlib` decompression within a 64 MB ceiling.
+- `[SEC-03]` Validates MS-CFB magic bytes, caps directory entries (8,192) and stream reads (128 MB), and tracks visited sectors across `DIFAT`, `FAT`, and `MiniFAT` chains to terminate cycles cleanly.
+- `[SEC-04]` Validates filesystem paths against null bytes and Windows reserved device names.
+- `[SEC-05]` Strips disallowed XML 1.0 control characters and prefixes spreadsheet formula characters (`=`, `+`, `-`, `@`) with `'` during export.
+- `[SEC-06]` Deep-copies `SectionIR.blocks` prior to elastic layout solving for repeatable runs on the same `job_id`, bounded by a 64-job in-memory LRU cache.
+
+## 7. Known Scope Boundaries & Trade-offs
+- Encrypted/DRM-protected `.hwp` or `.docx` files are out of scope and rejected before parsing.
+- Legacy HWP visual controls beyond text, tables, images, and `Tag 105` equations (such as custom HWP script macros or embedded OLE charts) are skipped rather than executed.
+- The built-in Tier-3 pure-Python PDF 1.4 writer lays out UTF-16BE CJK streams using box-model height estimation; for pixel-level print proofing on Windows or Linux, Tier-1 (MS Word COM) or Tier-2 (LibreOffice `soffice`) is preferred when available.

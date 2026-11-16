@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sadt-mcp"
+version = "4.1.0"
+description = "SADT (Stella Actuation Document Transfer): Zero-dependency Python MCP server and document converter for HWP, HWPX, DOCX, XLSX, HTML, PDF, Markdown, and CSV with layout and equation support."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [{name = "Team Sequence"}]
+keywords = [
+  "hwp",
+  "hwpx",
+  "docx",
+  "xlsx",
+  "pdf",
+  "markdown",
+  "mcp",
+  "mcp-server",
+  "document-converter",
+  "korean",
+  "hangul",
+  "ooxml",
+  "owpml",
+  "sadt",
+  "t-dir"
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Topic :: Text Processing :: Markup",
+  "Topic :: Office/Business",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12"
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/Team-Sequence-Thaumaturge/-document-IR"
+Repository = "https://github.com/Team-Sequence-Thaumaturge/-document-IR.git"
+Issues = "https://github.com/Team-Sequence-Thaumaturge/-document-IR/issues"
+
+[project.scripts]
+sadt-mcp = "tdir_mcp_beta.mcp_server:run_stdio_loop"
+sadt = "tdir_mcp_beta.mcp_server:run_stdio_loop"
+tdir-mcp = "tdir_mcp_beta.mcp_server:run_stdio_loop"
+
+[tool.setuptools]
+packages = ["tdir_mcp_beta"]
+
+[tool.setuptools.package-dir]
+tdir_mcp_beta = "."

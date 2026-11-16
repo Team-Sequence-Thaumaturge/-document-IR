@@ -1,12 +1,13 @@
 """
-T-DIR v4.0 Isolated MCP Server (JSON-RPC 2.0 over stdio + Direct Python API).
+SADT (Stella Actuation Document Transfer) v4.1.0 MCP Server (JSON-RPC 2.0 over stdio + Direct Python API).
+Powered by T-DIR (Topological Document Intermediate Representation).
 Zero hardcoded font names, pixel/HWPUNIT constants, document-specific section IDs, or fixed page counts:
   - Dynamically extracts source & target specifications at runtime (`tdir_probe_files`).
   - Resolves generic section/slot topologies (`SEC_01..SEC_K`, `SLOT_01..SLOT_M`, `MEDIA_01..MEDIA_P`)
     and numerical page budgets (`solve_document_page_budgets`) via `UserSpecOverrideIR`.
   - Supports 8-format N-to-M conversion (`.hwp`, `.hwpx`, `.docx`, `.md`, `.csv`, `.xlsx`, `.html`, `.pdf`),
-    3-Way Equation AST isomorphism (`OMML` <-> `HWP EQN` <-> `LaTeX`), standalone `.hwpx` synthesis,
-    3-tier cross-platform PDF verification, and full security hardening (`[SEC-01]`..`[SEC-06]`).
+    3-Way Equation AST translation (`OMML` <-> `HWP EQN` <-> `LaTeX`), standalone `.hwpx` synthesis,
+    3-tier cross-platform PDF verification, and defensive input/archive validation (`[SEC-01]`..`[SEC-06]`).
 Exposes 5 tools:
   1. tdir_probe_files
   2. tdir_build_mapping_plan
@@ -25,6 +26,16 @@ import shutil
 import zipfile
 import subprocess
 from typing import List, Dict, Optional, Tuple
+
+if __package__ in (None, ""):
+    import types as _types
+    _pkg_root = os.path.dirname(os.path.abspath(__file__))
+    if "tdir_mcp_beta" not in sys.modules:
+        _pkg_mod = _types.ModuleType("tdir_mcp_beta")
+        _pkg_mod.__path__ = [_pkg_root]
+        _pkg_mod.__package__ = "tdir_mcp_beta"
+        sys.modules["tdir_mcp_beta"] = _pkg_mod
+    __package__ = "tdir_mcp_beta"
 
 from .ir_schema import (
     SectionIR,
@@ -909,6 +920,9 @@ class TdirBetaMcpServer:
         }
 
 
+SadtMcpServer = TdirBetaMcpServer
+
+
 MCP_TOOLS_SCHEMA = [
     {
         "name": "tdir_probe_files",
@@ -944,8 +958,8 @@ MCP_TOOLS_SCHEMA = [
     {
         "name": "tdir_execute_conversion",
         "description": (
-            "Execute T-DIR v4.0 conversion into target formats (.hwp, .hwpx, .docx, .md, .csv, .xlsx, .html, .pdf) "
-            "using dynamically resolved specifications and optional user_spec_overrides with 100% text preservation."
+            "Execute SADT (T-DIR v4.1) conversion into target formats (.hwp, .hwpx, .docx, .md, .csv, .xlsx, .html, .pdf) "
+            "using dynamically resolved specifications and optional user_spec_overrides with high-fidelity text preservation."
         ),
         "inputSchema": {
             "type": "object",
@@ -962,7 +976,7 @@ MCP_TOOLS_SCHEMA = [
     {
         "name": "tdir_verify_fidelity_and_layout",
         "description": (
-            "Verify 100.00% non-whitespace SHA-256 text immutability across generated outputs and execute "
+            "Run non-whitespace SHA-256 text consistency checks across generated outputs and execute "
             "3-tier cross-platform PDF page-budget verification (MS Word COM / LibreOffice / Built-in PDF 1.4)."
         ),
         "inputSchema": {
@@ -1004,7 +1018,7 @@ def handle_jsonrpc_request(server: TdirBetaMcpServer, req: dict) -> Optional[dic
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "tdir-document-beta", "version": "4.0.0"},
+                "serverInfo": {"name": "sadt-mcp", "version": "4.1.0"},
             },
         }
     if method == "notifications/initialized":

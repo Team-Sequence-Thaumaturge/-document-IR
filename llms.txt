@@ -1,0 +1,29 @@
+# SADT (Stella Actuation Document Transfer)
+
+> Zero-dependency Python MCP server and Topological Document Intermediate Representation (T-DIR) engine for converting, fitting, and verifying HWP v5.0 (.hwp), OWPML (.hwpx), MS Word (.docx), Excel (.xlsx), HTML5 (.html), PDF 1.4 (.pdf), Markdown (.md), and CSV/TSV documents across macOS, Linux, and Windows without requiring Hancom Office or LibreOffice.
+
+## What Problems SADT Solves
+- Converts Korean HWP (.hwp, .hwpx) and Office/developer formats (.docx, .xlsx, .html, .pdf, .md, .csv) using pure Python standard libraries with zero pip dependencies.
+- Fills rigid multi-section HWP/HWPX form templates (such as Korean government grants and business plans with outer container tables and bottom 2R x C media grids) while fitting per-section and total page budgets.
+- Translates mathematical formulas across MS Word OMML, Hancom HWP Equation Script, and LaTeX using a shared Abstract Syntax Tree (AST).
+- Enables AI coding assistants and agents (Claude Desktop, Cursor, Windsurf, Antigravity) to probe template geometry, resolve user overrides, convert documents, and check non-whitespace SHA-256 text consistency over MCP (stdio).
+- Status note: SADT v4.1.0 is an actively developed open-source project; core conversion and 14 parametric regression cohorts pass, while highly customized visual macros or complex floating drawing objects in legacy files may require manual review.
+
+## Quick Installation & One-Line Run
+- Run over stdio without cloning: `uvx --from git+https://github.com/Team-Sequence-Thaumaturge/-document-IR sadt-mcp`
+- Install via pip: `pip install git+https://github.com/Team-Sequence-Thaumaturge/-document-IR.git`
+- Run directly from cloned directory: `python mcp_server.py`
+
+## MCP Tools Summary
+- `tdir_probe_files`: Inspect source files and target template typography, page geometry, section slots, and media grids at runtime.
+- `tdir_build_mapping_plan`: Resolve `UserSpecOverrideIR > TargetDocumentSpecIR > SourceDocumentSpecIR`, map sections to slots, and preview 6-stage elastic layout adjustments.
+- `tdir_execute_conversion`: Generate `.hwp`, `.hwpx`, `.docx`, `.xlsx`, `.html`, `.pdf`, `.md`, and `.csv` outputs matching resolved typography and page budgets.
+- `tdir_verify_fidelity_and_layout`: Run non-whitespace SHA-256 text consistency checks across generated outputs and check PDF page budgets via MS Word COM, LibreOffice, or built-in PDF 1.4 output.
+- `tdir_adjust_block_layout`: Adjust individual paragraph merge locks or table column widths and refresh solver telemetry.
+
+## Documentation & Manifests
+- [English Documentation](https://github.com/Team-Sequence-Thaumaturge/-document-IR/blob/main/README.md): Full user guide, comparison matrix, MCP configuration, and FAQ.
+- [Korean Documentation](https://github.com/Team-Sequence-Thaumaturge/-document-IR/blob/main/README_KO.md): Korean architecture guide, quickstart, and regression report.
+- [Full Agent Guide](https://github.com/Team-Sequence-Thaumaturge/-document-IR/blob/main/llms-full.txt): Detailed tool parameter schemas, override options, comparison notes, and operational trade-offs.
+- [MCP Registry Manifest](https://github.com/Team-Sequence-Thaumaturge/-document-IR/blob/main/server.json): Standard MCP server metadata and stdio package coordinates.
+- [Python Packaging](https://github.com/Team-Sequence-Thaumaturge/-document-IR/blob/main/pyproject.toml): PEP 621 build metadata and `sadt-mcp` / `sadt` console entrypoints.
