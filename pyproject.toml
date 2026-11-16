@@ -9,7 +9,7 @@ description = "SADT (Stella Actuation Document Transfer): Zero-dependency Python
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "Apache-2.0"}
-authors = [{name = "Team Sequence"}]
+authors = [{name = "김치성 (Kim Chisung) / Team Sequence", email = "chi@quanxs.com"}]
 keywords = [
   "hwp",
   "hwpx",
@@ -41,6 +41,7 @@ dependencies = []
 
 [project.urls]
 Homepage = "https://github.com/Team-Sequence-Thaumaturge/-document-IR"
+Documentation = "https://salabs.quanxs.com/tools/sadt-hwp-hwpx-document-mcp-hub.html"
 Repository = "https://github.com/Team-Sequence-Thaumaturge/-document-IR.git"
 Issues = "https://github.com/Team-Sequence-Thaumaturge/-document-IR/issues"
 

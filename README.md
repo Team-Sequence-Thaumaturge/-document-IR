@@ -1,8 +1,14 @@
 # SADT (Stella Actuation Document Transfer) — HWP · HWPX · DOCX Document MCP Server
 
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](./LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB.svg)](./pyproject.toml)
+[![Dependencies: 0 Stdlib Only](https://img.shields.io/badge/Dependencies-0%20(Stdlib%20Only)-00C853.svg)](./pyproject.toml)
+[![MCP: stdio](https://img.shields.io/badge/MCP-stdio%20%7C%20JSON--RPC%202.0-8A2BE2.svg)](./server.json)
+[![Formats: 8 Types](https://img.shields.io/badge/Formats-HWP%20%C2%B7%20HWPX%20%C2%B7%20DOCX%20%C2%B7%20XLSX%20%C2%B7%20PDF%20%C2%B7%20HTML%20%C2%B7%20MD%20%C2%B7%20CSV-0ea5e9.svg)](./README.md)
+
 **[last patch : 2026-11-16 07:43:00 UTC]**
 
-🌐 **[English (./README.md)](./README.md)** | 🇰🇷 **[한국어 (./README_KO.md)](./README_KO.md)** | 🤖 **[Agent Summary (./llms.txt)](./llms.txt)** | 📋 **[MCP Manifest (./server.json)](./server.json)**
+🌐 **[English (./README.md)](./README.md)** | 🇰🇷 **[한국어 (./README_KO.md)](./README_KO.md)** | 🤖 **[Agent Summary (./llms.txt)](./llms.txt)** | 📋 **[MCP Manifest (./server.json)](./server.json)** | 🌐 **[Official Showcase Hub](https://salabs.quanxs.com/tools/sadt-hwp-hwpx-document-mcp-hub.html)**
 
 > [!NOTE]
 > **Active Open-Source Release (`v4.1.0`) — Capabilities & Current Scope**
@@ -24,43 +30,50 @@
 
 ---
 
-## 2. Quickstart (`uvx`, `pip`, or Direct Execution)
+## 2. Quickstart (Zero-Clone One-Line `uvx` / `pip` or Local Run)
 
-**Repository URL**: [Team-Sequence-Thaumaturge/-document-IR](https://github.com/Team-Sequence-Thaumaturge/-document-IR) (see [`./llms.txt`](./llms.txt) or [`./server.json`](./server.json) for the remote `git+https` `uvx` manifest snippet).
-
-### Option A — Run via `uvx` or `pip` (Zero External Dependencies)
-Clone the repository linked above, then install or launch `sadt-mcp` directly via `uvx` or `pip`:
+### Option A — Zero-Clone One-Line Run via `uvx` or `pip` (Recommended)
+Run `sadt-mcp` directly from GitHub with zero external pip dependencies:
 
 ```bash
-git clone <repository-url>
-cd -document-IR
+# 1. Run MCP stdio server immediately without cloning (uvx)
+uvx --from git+https://github.com/Team-Sequence-Thaumaturge/-document-IR sadt-mcp
 
-# Launch MCP stdio server directly with uvx
-uvx --from . sadt-mcp
-
-# Or install locally with pip and run the CLI entrypoint
-pip install -e .
+# 2. Or install via pip directly from GitHub
+pip install git+https://github.com/Team-Sequence-Thaumaturge/-document-IR.git
 sadt-mcp
-
-# Or run standalone with Python 3.10+
-python mcp_server.py
 ```
 
-Add `sadt-mcp` to Claude Desktop, Cursor, Windsurf, or Antigravity MCP settings:
+Add `sadt-mcp` directly to Claude Desktop, Cursor, Windsurf, or Antigravity MCP settings (no local clone needed):
 
 ```json
 {
   "mcpServers": {
     "sadt-mcp": {
       "command": "uvx",
-      "args": ["--from", "/path/to/-document-IR", "sadt-mcp"]
+      "args": [
+        "--from",
+        "git+https://github.com/Team-Sequence-Thaumaturge/-document-IR",
+        "sadt-mcp"
+      ]
     }
   }
 }
 ```
 
+### Option B — Local Clone & Development
+```bash
+git clone https://github.com/Team-Sequence-Thaumaturge/-document-IR.git
+cd -document-IR
+
+# Editable install or standalone execution with Python 3.10+
+pip install -e .
+sadt-mcp
+# or: python mcp_server.py
+```
+
 > [!TIP]
-> You can also run without cloning by passing the `git+https` repository URL from [`./llms.txt`](./llms.txt) as the `--from` argument to `uvx` or `pip install`.
+> See the interactive bilingual showcase & MCP snippet generator at **[Quanxs SA Labs — SADT Hub](https://salabs.quanxs.com/tools/sadt-hwp-hwpx-document-mcp-hub.html)**, or machine-readable agent specs in [`./llms.txt`](./llms.txt) and [`./server.json`](./server.json).
 
 ---
 

@@ -1,0 +1,27 @@
+cff-version: 1.2.0
+title: "SADT: Stella Actuation Document Transfer — Zero-Dependency HWP/HWPX & Office Document MCP Server"
+message: "If you use SADT (-document-IR) in your research or software, please cite it using this metadata."
+type: software
+authors:
+  - family-names: Kim
+    given-names: Chisung
+    alias: "김치성"
+    email: chi@quanxs.com
+    affiliation: "Quanxs (Team Sequence)"
+version: 4.1.0
+date-released: "2026-11-16"
+license: Apache-2.0
+repository-code: "https://github.com/Team-Sequence-Thaumaturge/-document-IR"
+url: "https://salabs.quanxs.com/tools/sadt-hwp-hwpx-document-mcp-hub.html"
+abstract: "Zero-dependency Python 3.10+ MCP server and Topological Document Intermediate Representation (T-DIR) engine for converting, fitting, and verifying Korean HWP v5.0 (.hwp), OWPML (.hwpx), MS Word (.docx), Excel (.xlsx), HTML5 (.html), PDF 1.4 (.pdf), Markdown (.md), and CSV/TSV documents with 3-way equation AST translation."
+keywords:
+  - hwp
+  - hwpx
+  - mcp
+  - mcp-server
+  - docx
+  - xlsx
+  - pdf
+  - korean
+  - hangul
+  - sadt

@@ -1,8 +1,14 @@
 # SADT (Stella Actuation Document Transfer) — 한글(HWP·HWPX) · 워드(DOCX) 문서 변환 MCP 서버
 
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](./LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB.svg)](./pyproject.toml)
+[![Dependencies: 0 Stdlib Only](https://img.shields.io/badge/Dependencies-0%20(Stdlib%20Only)-00C853.svg)](./pyproject.toml)
+[![MCP: stdio](https://img.shields.io/badge/MCP-stdio%20%7C%20JSON--RPC%202.0-8A2BE2.svg)](./server.json)
+[![Formats: 8 Types](https://img.shields.io/badge/Formats-HWP%20%C2%B7%20HWPX%20%C2%B7%20DOCX%20%C2%B7%20XLSX%20%C2%B7%20PDF%20%C2%B7%20HTML%20%C2%B7%20MD%20%C2%B7%20CSV-0ea5e9.svg)](./README_KO.md)
+
 **[last patch : 2026-11-16 07:43:00 UTC]**
 
-🌐 **[English (./README.md)](./README.md)** | 🇰🇷 **[한국어 (./README_KO.md)](./README_KO.md)** | 🤖 **[에이전트 요약 (./llms.txt)](./llms.txt)** | 📋 **[MCP 매니페스트 (./server.json)](./server.json)**
+🌐 **[English (./README.md)](./README.md)** | 🇰🇷 **[한국어 (./README_KO.md)](./README_KO.md)** | 🤖 **[에이전트 요약 (./llms.txt)](./llms.txt)** | 📋 **[MCP 매니페스트 (./server.json)](./server.json)** | 🌐 **[공식 소개 허브](https://salabs.quanxs.com/tools/sadt-hwp-hwpx-document-mcp-hub.html)**
 
 > [!NOTE]
 > **지속 개선 중인 오픈소스 프로젝트 (`v4.1.0`) — 기능 범위 및 한계 안내**
@@ -24,43 +30,50 @@
 
 ---
 
-## 2. 빠른 시작 (`uvx` / `pip` 원라인 실행)
+## 2. 빠른 시작 (클론 없는 `uvx` / `pip` 원라인 실행 또는 로컬 실행)
 
-**원격 저장소**: [Team-Sequence-Thaumaturge/-document-IR](https://github.com/Team-Sequence-Thaumaturge/-document-IR) (원격 URL 기반 원라인 실행 커맨드 전문은 [`./llms.txt`](./llms.txt) 및 [`./server.json`](./server.json)에서도 바로 복사할 수 있습니다.)
-
-### 방법 A — `uvx` 또는 `pip` 설치 실행 (외부 의존성 없음)
-위 저장소를 클론한 뒤 `uvx` 또는 `pip`로 `sadt-mcp` 엔트리포인트를 즉시 실행할 수 있습니다.
+### 방법 A — 클론 없이 `uvx` 또는 `pip` 원라인 실행 (권장)
+외부 패키지 설치 없이 GitHub에서 즉시 `sadt-mcp`를 실행할 수 있습니다.
 
 ```bash
-git clone <repository-url>
-cd -document-IR
+# 1. 클론 없이 uvx로 MCP stdio 서버 즉시 실행
+uvx --from git+https://github.com/Team-Sequence-Thaumaturge/-document-IR sadt-mcp
 
-# uvx로 즉시 실행
-uvx --from . sadt-mcp
-
-# 또는 pip 로컬 설치 후 CLI 엔트리포인트 실행
-pip install -e .
+# 2. 또는 pip로 GitHub 저장소 직접 설치 후 실행
+pip install git+https://github.com/Team-Sequence-Thaumaturge/-document-IR.git
 sadt-mcp
-
-# 또는 Python 3.10+ 단독 실행
-python mcp_server.py
 ```
 
-Claude Desktop, Cursor, Windsurf, Antigravity 등의 MCP 설정에 아래 블록을 추가해 연동하세요.
+Claude Desktop, Cursor, Windsurf, Antigravity 등의 MCP 설정에 아래 JSON을 그대로 붙여넣어 연동하세요:
 
 ```json
 {
   "mcpServers": {
     "sadt-mcp": {
       "command": "uvx",
-      "args": ["--from", "/path/to/-document-IR", "sadt-mcp"]
+      "args": [
+        "--from",
+        "git+https://github.com/Team-Sequence-Thaumaturge/-document-IR",
+        "sadt-mcp"
+      ]
     }
   }
 }
 ```
 
+### 방법 B — 로컬 클론 및 개발 실행
+```bash
+git clone https://github.com/Team-Sequence-Thaumaturge/-document-IR.git
+cd -document-IR
+
+# 개발 모드 설치 또는 Python 3.10+ 단독 실행
+pip install -e .
+sadt-mcp
+# 또는: python mcp_server.py
+```
+
 > [!TIP]
-> 로컬 클론 없이 바로 실행하려면 [`./llms.txt`](./llms.txt)에 기재된 `git+https` 저장소 URL을 `uvx --from` 또는 `pip install` 인자로 넘기면 됩니다.
+> **[Quanxs SA Labs — SADT 공식 허브](https://salabs.quanxs.com/tools/sadt-hwp-hwpx-document-mcp-hub.html)** 페이지에서도 한/영 가이드와 1클릭 MCP 설정 복사를 바로 이용하실 수 있습니다. 상세 에이전트 규격은 [`./llms.txt`](./llms.txt)와 [`./server.json`](./server.json)을 참고하세요.
 
 ---
 
